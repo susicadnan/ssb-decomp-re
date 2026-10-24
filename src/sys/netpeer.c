@@ -132,6 +132,8 @@ u8 sSYNetPeerLobbyFighters[2];
 u32 sSYNetPeerLobbyStageKind;
 u32 sSYNetPeerLobbyDelay;
 u32 sSYNetPeerLobbyStage;
+u32 sSYNetPeerLobbyStocks;       /* 0 = not a stock match */
+u32 sSYNetPeerLobbyTimeMinutes;  /* 0 = no time limit */
 /* Between games of a lobby match: who wants another one. */
 sb32 sSYNetPeerPostMatch;
 sb32 sSYNetPeerRematchLocal;
@@ -416,12 +418,29 @@ void syNetPeerMakeBootstrapMetadata(SYNetInputReplayMetadata *metadata)
 	metadata->fighter_kinds[1] = nFTKindFox;
 
 #ifdef PORT
-	/* A lobby-driven session carries the players' picks. */
+	/* A lobby-driven session carries the players' picks and the rules. */
 	if (sSYNetPeerLobbyHasPicks != FALSE)
 	{
 		metadata->fighter_kinds[0] = sSYNetPeerLobbyFighters[0];
 		metadata->fighter_kinds[1] = sSYNetPeerLobbyFighters[1];
 		metadata->stage_kind = sSYNetPeerLobbyStageKind;
+		metadata->game_rules = 0;
+
+		if (sSYNetPeerLobbyStocks != 0)
+		{
+			metadata->game_rules |= SCBATTLE_GAMERULE_STOCK;
+			metadata->stocks = sSYNetPeerLobbyStocks;
+		}
+		if (sSYNetPeerLobbyTimeMinutes != 0)
+		{
+			metadata->game_rules |= SCBATTLE_GAMERULE_TIME;
+			metadata->time_limit = sSYNetPeerLobbyTimeMinutes;
+		}
+		if (metadata->game_rules == 0)
+		{
+			metadata->game_rules = SCBATTLE_GAMERULE_STOCK;
+			metadata->stocks = 3;
+		}
 	}
 #endif
 }
@@ -787,7 +806,8 @@ void syNetPeerResetConfig(void)
  * nSCKindVSBattle. This is the per-frame form of syNetPeerRunBootstrap's
  * blocking loop; the packets are the same. Host = player 0, client = 1. */
 void syNetPeerLobbyConfigure(intptr_t sock, const PortNetAddr *peer, sb32 is_host, u32 delay, u32 session_id,
-                             u32 seed, u8 host_fighter, u8 client_fighter, u32 stage_kind)
+                             u32 seed, u8 host_fighter, u8 client_fighter, u32 stage_kind, u32 stocks,
+                             u32 time_minutes)
 {
 	if (sSYNetPeerSocket != sock)
 	{
@@ -797,6 +817,8 @@ void syNetPeerLobbyConfigure(intptr_t sock, const PortNetAddr *peer, sb32 is_hos
 	sSYNetPeerLobbySession = TRUE;
 	sSYNetPeerLobbyDelay = delay;
 	sSYNetPeerLobbyStage = stage_kind;
+	sSYNetPeerLobbyStocks = stocks;
+	sSYNetPeerLobbyTimeMinutes = time_minutes;
 
 	sSYNetPeerIsEnabled = TRUE;
 	sSYNetPeerIsConfigured = TRUE;
@@ -826,9 +848,9 @@ void syNetPeerLobbyConfigure(intptr_t sock, const PortNetAddr *peer, sb32 is_hos
 		syNetPeerMakeBootstrapMetadata(&sSYNetPeerBootstrapMetadata);
 		syNetPeerApplyBootstrapMetadata(&sSYNetPeerBootstrapMetadata);
 	}
-	port_log("SSB64 NetPeer: lobby session role=%s delay=%u session=%u seed=%u fighters=%u/%u stage=%u\n",
+	port_log("SSB64 NetPeer: lobby session role=%s delay=%u session=%u seed=%u fighters=%u/%u stage=%u stocks=%u time=%u\n",
 	         (is_host != FALSE) ? "host" : "client", delay, sSYNetPeerSessionID, sSYNetPeerBootstrapSeed,
-	         host_fighter, client_fighter, stage_kind);
+	         host_fighter, client_fighter, stage_kind, stocks, time_minutes);
 }
 
 /* 1 = match config exchanged (enter the battle), 0 = still going, -1 = gave
@@ -980,7 +1002,8 @@ s32 syNetPeerRematchStep(void)
 		 * arrived first and ours was lost; the bootstrap repeats anyway. */
 		syNetPeerSendPingPacket(SYNETPEER_PACKET_REMATCH, sSYNetPeerRematchLocalFighter);
 		syNetPeerLobbyConfigure(sSYNetPeerSocket, &sSYNetPeerPeerAddress, is_host, sSYNetPeerLobbyDelay,
-		                        sSYNetPeerSessionID, seed, host_fighter, client_fighter, sSYNetPeerLobbyStage);
+		                        sSYNetPeerSessionID, seed, host_fighter, client_fighter, sSYNetPeerLobbyStage,
+		                        sSYNetPeerLobbyStocks, sSYNetPeerLobbyTimeMinutes);
 		return 1;
 	}
 	return 0;
