@@ -26,6 +26,10 @@ extern void syNetPeerLobbyConfigure(intptr_t sock, const PortNetAddr *peer, sb32
 extern s32 syNetPeerLobbyStep(void);
 extern void syNetPeerLobbyAbort(void);
 extern void syNetPeerAbortMatch(const char *reason);
+extern void syNetPeerRematchRequest(u8 my_fighter);
+extern s32 syNetPeerRematchStep(void);
+extern sb32 syNetPeerCheckPostMatch(void);
+extern sb32 syNetPeerCheckPeerWantsRematch(void);
 #endif
 
 #endif /* _SYNETPEER_H_ */

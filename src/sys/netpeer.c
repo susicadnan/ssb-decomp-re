@@ -49,6 +49,8 @@ extern void port_log(const char *fmt, ...);
 #define SYNETPEER_PACKET_BATTLE_START 5
 #define SYNETPEER_PACKET_PING 6
 #define SYNETPEER_PACKET_PONG 7
+#define SYNETPEER_PACKET_REMATCH 8 /* ping-sized; the stamp field carries the sender's fighter kind */
+#define SYNETPEER_REMATCH_INTERVAL_FRAMES 30
 /* PING/PONG: control header + a u32 millisecond stamp the peer echoes back. */
 #define SYNETPEER_PING_PACKET_BYTES (4 + 2 + 2 + 4 + 4 + 4)
 #define SYNETPEER_PING_INTERVAL_FRAMES 30
@@ -121,12 +123,22 @@ PortNetAddr sSYNetPeerBindAddress;
 PortNetAddr sSYNetPeerPeerAddress;
 /* Lobby-driven session (syNetPeerLobbyConfigure / syNetPeerLobbyStep). */
 sb32 sSYNetPeerLobbyActive;
+sb32 sSYNetPeerLobbySession;   /* the socket belongs to a lobby match (kept open between games) */
 s32 sSYNetPeerLobbyPhase;
 u32 sSYNetPeerLobbyFrames;
 u32 sSYNetPeerLobbyStartRepeat;
 sb32 sSYNetPeerLobbyHasPicks;
 u8 sSYNetPeerLobbyFighters[2];
 u32 sSYNetPeerLobbyStageKind;
+u32 sSYNetPeerLobbyDelay;
+u32 sSYNetPeerLobbyStage;
+/* Between games of a lobby match: who wants another one. */
+sb32 sSYNetPeerPostMatch;
+sb32 sSYNetPeerRematchLocal;
+sb32 sSYNetPeerRematchPeer;
+u8 sSYNetPeerRematchLocalFighter;
+u8 sSYNetPeerRematchPeerFighter;
+u32 sSYNetPeerRematchFrames;
 #endif
 
 u32 syNetPeerChecksumAccumulateU32(u32 checksum, u32 value)
@@ -511,6 +523,11 @@ void syNetPeerHandlePingPacket(const u8 *buffer, s32 size)
 		/* Smooth a little; a single late packet should not bounce the HUD. */
 		sSYNetPeerPingMs = (sSYNetPeerPingMs == 0) ? rtt : (sSYNetPeerPingMs * 3 + rtt) / 4;
 	}
+	else if (packet_type == SYNETPEER_PACKET_REMATCH)
+	{
+		sSYNetPeerRematchPeer = TRUE;
+		sSYNetPeerRematchPeerFighter = (u8)stamp_ms;
+	}
 }
 
 void syNetPeerSendMatchConfigPacket(void)
@@ -756,7 +773,11 @@ void syNetPeerResetConfig(void)
 	sSYNetPeerExecutionHoldFrames = 0;
 	sSYNetPeerExecutionBeginLogged = FALSE;
 	sSYNetPeerLobbyActive = FALSE;
+	sSYNetPeerLobbySession = FALSE;
 	sSYNetPeerLobbyHasPicks = FALSE;
+	sSYNetPeerPostMatch = FALSE;
+	sSYNetPeerRematchLocal = FALSE;
+	sSYNetPeerRematchPeer = FALSE;
 }
 
 /* ---- Lobby-driven sessions (port/netplay/lobby.cpp) ----
@@ -768,8 +789,14 @@ void syNetPeerResetConfig(void)
 void syNetPeerLobbyConfigure(intptr_t sock, const PortNetAddr *peer, sb32 is_host, u32 delay, u32 session_id,
                              u32 seed, u8 host_fighter, u8 client_fighter, u32 stage_kind)
 {
-	syNetPeerCloseSocket();
+	if (sSYNetPeerSocket != sock)
+	{
+		syNetPeerCloseSocket();
+	}
 	syNetPeerResetConfig();
+	sSYNetPeerLobbySession = TRUE;
+	sSYNetPeerLobbyDelay = delay;
+	sSYNetPeerLobbyStage = stage_kind;
 
 	sSYNetPeerIsEnabled = TRUE;
 	sSYNetPeerIsConfigured = TRUE;
@@ -887,7 +914,76 @@ void syNetPeerLobbyAbort(void)
 {
 	sSYNetPeerLobbyActive = FALSE;
 	syNetPeerStopVSSession();
+	syNetPeerCloseSocket();
 	syNetPeerResetConfig();
+}
+
+void syNetPeerHandlePacket(const u8 *buffer, s32 size);
+
+/* ---- Rematch (between games of a lobby match) ----
+ * syNetPeerStopVSSession keeps the socket of a lobby match open and marks
+ * the session post-match; the Netplay page offers Rematch / Leave. Each side
+ * that wants another game sends REMATCH (with its fighter pick) every half
+ * second; when both do, the host re-runs the match config exchange with a
+ * fresh seed and syNetPeerLobbyStep takes over again. */
+void syNetPeerRematchRequest(u8 my_fighter)
+{
+	if (sSYNetPeerPostMatch == FALSE)
+	{
+		return;
+	}
+	sSYNetPeerRematchLocal = TRUE;
+	sSYNetPeerRematchLocalFighter = my_fighter;
+	sSYNetPeerRematchFrames = SYNETPEER_REMATCH_INTERVAL_FRAMES; /* send at once */
+}
+
+sb32 syNetPeerCheckPostMatch(void)
+{
+	return sSYNetPeerPostMatch;
+}
+
+sb32 syNetPeerCheckPeerWantsRematch(void)
+{
+	return sSYNetPeerRematchPeer;
+}
+
+/* 1 = both agreed and the new match config exchange is running (drive
+ * syNetPeerLobbyStep from here on), 0 = waiting, -1 = not in a post-match
+ * lobby session. */
+s32 syNetPeerRematchStep(void)
+{
+	u8 buffer[SYNETPEER_PACKET_BYTES];
+
+	if (sSYNetPeerPostMatch == FALSE)
+	{
+		return -1;
+	}
+	syNetPeerReceiveAll(syNetPeerHandlePacket, buffer, sizeof(buffer));
+
+	if (sSYNetPeerRematchLocal != FALSE)
+	{
+		if (++sSYNetPeerRematchFrames >= SYNETPEER_REMATCH_INTERVAL_FRAMES)
+		{
+			sSYNetPeerRematchFrames = 0;
+			syNetPeerSendPingPacket(SYNETPEER_PACKET_REMATCH, sSYNetPeerRematchLocalFighter);
+		}
+	}
+	if ((sSYNetPeerRematchLocal != FALSE) && (sSYNetPeerRematchPeer != FALSE))
+	{
+		sb32 is_host = sSYNetPeerBootstrapIsHost;
+		u8 host_fighter = (is_host != FALSE) ? sSYNetPeerRematchLocalFighter : sSYNetPeerRematchPeerFighter;
+		u8 client_fighter = (is_host != FALSE) ? sSYNetPeerRematchPeerFighter : sSYNetPeerRematchLocalFighter;
+		u32 seed = (u32)port_netsock_now_ms() | 1u;
+
+		port_log("SSB64 NetPeer: rematch agreed, fighters=%u/%u\n", host_fighter, client_fighter);
+		/* Let the peer see our REMATCH a few more times in case theirs
+		 * arrived first and ours was lost; the bootstrap repeats anyway. */
+		syNetPeerSendPingPacket(SYNETPEER_PACKET_REMATCH, sSYNetPeerRematchLocalFighter);
+		syNetPeerLobbyConfigure(sSYNetPeerSocket, &sSYNetPeerPeerAddress, is_host, sSYNetPeerLobbyDelay,
+		                        sSYNetPeerSessionID, seed, host_fighter, client_fighter, sSYNetPeerLobbyStage);
+		return 1;
+	}
+	return 0;
 }
 
 /* The match cannot continue (peer gone, or they quit): tear the session
@@ -901,7 +997,9 @@ void syNetPeerAbortMatch(const char *reason)
 
 	port_log("SSB64 NetPeer: match aborted: %s\n", reason);
 	syNetStateStopVSSession();
+	sSYNetPeerLobbySession = FALSE; /* no rematch after a lost connection */
 	syNetPeerStopVSSession();
+	syNetPeerCloseSocket();
 	syNetPeerResetConfig();
 	port_lobby_notify_match_over(reason);
 	portSCManagerRequestResetTo(nSCKindVSMode, nSCKindVSMode);
@@ -1614,7 +1712,23 @@ void syNetPeerStopVSSession(void)
 		         sSYNetPeerPacketsSent, sSYNetPeerPacketsReceived, sSYNetPeerPacketsDropped,
 		         sSYNetPeerFramesStaged, sSYNetPeerLateFrames, sSYNetPeerInputChecksum);
 	}
-	syNetPeerCloseSocket();
+	if ((sSYNetPeerLobbySession != FALSE) && (sSYNetPeerIsActive != FALSE) && (sSYNetPeerPostMatch == FALSE))
+	{
+		extern void port_lobby_notify_post_match(void);
+
+		/* A lobby match keeps its hole-punched socket so the players can
+		 * go again without the server; see syNetPeerRematchStep. */
+		sSYNetPeerPostMatch = TRUE;
+		sSYNetPeerRematchLocal = FALSE;
+		sSYNetPeerRematchPeer = FALSE;
+		sSYNetPeerIsActive = FALSE;
+		port_lobby_notify_post_match();
+		return;
+	}
+	if (sSYNetPeerLobbySession == FALSE)
+	{
+		syNetPeerCloseSocket();
+	}
 #endif
 	sSYNetPeerIsActive = FALSE;
 }
