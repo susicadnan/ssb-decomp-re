@@ -761,6 +761,19 @@ void syNetPeerMakeBootstrapMetadata(SYNetInputReplayMetadata *metadata)
 			metadata->game_rules = SCBATTLE_GAMERULE_STOCK;
 			metadata->stocks = 3;
 		}
+		/* Test hook: SSB64_NETPLAY_ITEMS=1..5 (very low .. very high) turns
+		 * every item on, for the rollback SyncTest. */
+		{
+			char *items_env = getenv("SSB64_NETPLAY_ITEMS");
+			s32 rate = (items_env != NULL) ? atoi(items_env) : 0;
+
+			if ((rate > nSCBattleItemSwitchNone) && (rate < nSCBattleItemSwitchEnumCount))
+			{
+				metadata->item_switch = rate;
+				metadata->item_appearance_rate = rate;
+				metadata->item_toggles = 0xFFFFFFFF;
+			}
+		}
 	}
 #endif
 }
