@@ -80,6 +80,7 @@ extern void port_log(const char *fmt, ...);
 	(4 + 2 + 2 + 4 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 4 + (SYNETPEER_MAX_MEMBERS * SYNETPEER_ROSTER_ENTRY_BYTES) +        \
 	 SYNETPEER_METADATA_BYTES + 4 + 4 + 4)
 #define SYNETPEER_MAX_DATAGRAM 512
+#define SYNETPEER_MAX_RECEIVE_PER_FRAME 256
 #define SYNETPEER_ROUND_RESEND_FRAMES 6
 #define SYNETPEER_ROUND_START_REPEAT 30
 #define SYNETPEER_ROUND_MEMBER_TIMEOUT_MS 10000
@@ -535,12 +536,14 @@ void syNetPeerHandleDatagram(const u8 *buffer, s32 size, s32 member);
 void syNetPeerReceiveAll(void)
 {
 	u8 buffer[SYNETPEER_MAX_DATAGRAM];
+	s32 count;
 
 	if (sSYNetPeerSocket < 0)
 	{
 		return;
 	}
-	while (TRUE)
+	/* Bounded, so a flood (or a packet loop) can't hold the frame up. */
+	for (count = 0; count < SYNETPEER_MAX_RECEIVE_PER_FRAME; count++)
 	{
 		PortNetAddr from;
 		s32 size = port_netsock_recvfrom(sSYNetPeerSocket, buffer, sizeof(buffer), &from);
