@@ -23,8 +23,10 @@ extern void syNetPeerStopVSSession(void);
 /* Lobby-driven session: see the comment block in netpeer.c. */
 extern void syNetPeerLobbyConfigure(intptr_t sock, const PortNetAddr *peer, sb32 is_host, u32 delay, u32 session_id,
                                     u32 seed, u8 host_fighter, u8 client_fighter, u32 stage_kind, u32 stocks,
-                                    u32 time_minutes);
+                                    u32 time_minutes, sb32 menu_mode);
 extern s32 syNetPeerLobbyStep(void);
+extern sb32 syNetPeerCheckMenuMode(void);
+extern void syNetPeerSendPeriodicPing(void);
 extern void syNetPeerLobbyAbort(void);
 extern void syNetPeerAbortMatch(const char *reason);
 extern void syNetPeerRematchRequest(u8 my_fighter);

@@ -5575,3 +5575,79 @@ void mnPlayersVSStartScene(void)
 	dMNPlayersVSTaskmanSetup.scene_setup.arena_size = (size_t) ((uintptr_t)&ovl1_VRAM - (uintptr_t)&ovl26_BSS_END);
 	scManagerFuncUpdate(&dMNPlayersVSTaskmanSetup);
 }
+
+#ifdef PORT
+/* Headless netplay test driver (sys/netmenu.c, SSB64_NETMENU_BOT=1): steer
+ * the player's cursor onto its own token, carry the token onto a portrait
+ * (Kirby for player 1, Fox for player 2, so a Kirby battle is what the
+ * in-menu test ends up in), drop it, then press START until the match
+ * begins. Writes the controller the slot will read this tick. */
+void portMNPlayersVSBotDrive(s32 player, u16 *buttons, s8 *stick_x, s8 *stick_y)
+{
+	MNPlayersSlotVS *slot = &sMNPlayersVSSlots[player];
+	SObj *cursor;
+	SObj *puck;
+	f32 dx, dy;
+	s32 portrait;
+
+	*buttons = 0;
+	*stick_x = 0;
+	*stick_y = 0;
+
+	if ((slot->cursor == NULL) || (slot->puck == NULL))
+	{
+		return;
+	}
+	cursor = SObjGetStruct(slot->cursor);
+	puck = SObjGetStruct(slot->puck);
+
+	if (slot->is_fighter_selected != FALSE)
+	{
+		if ((sMNPlayersVSTotalTimeTics % 60) == 0)
+		{
+			*buttons = START_BUTTON;
+		}
+		return;
+	}
+	if (slot->cursor_status == nMNPlayersCursorStatusGrab)
+	{
+		/* mnPlayersVSGetPuckFighterKind reads the puck at +13/+12; portrait
+		 * columns are 45 wide from x=25, rows at y 35..79 and 78..122. */
+		portrait = mnPlayersVSGetPortrait((player == 0) ? nFTKindKirby : nFTKindFox);
+		dx = (25.0F + 45.0F * (portrait % 6) + 22.0F) - (puck->pos.x + 13.0F);
+		dy = ((portrait < 6) ? 57.0F : 100.0F) - (puck->pos.y + 12.0F);
+	}
+	else
+	{
+		/* mnPlayersVSCheckPuckInRange: cursor+25 within puck.x..+26, cursor+3
+		 * within puck.y..+24. */
+		dx = (puck->pos.x + 13.0F) - (cursor->pos.x + 25.0F);
+		dy = (puck->pos.y + 12.0F) - (cursor->pos.y + 3.0F);
+	}
+	if ((sMNPlayersVSTotalTimeTics % 120) == 0)
+	{
+		extern void port_log(const char *fmt, ...);
+
+		port_log("SSB64 CSS bot p%d: cursor=(%.0f,%.0f) puck=(%.0f,%.0f) status=%d pkind=%d held=%d holder=%d fkind=%d d=(%.0f,%.0f) recall=%d/%d\n",
+		         player, cursor->pos.x, cursor->pos.y, puck->pos.x, puck->pos.y, slot->cursor_status, slot->pkind,
+		         slot->held_player, slot->holder_player, slot->fkind, dx, dy, slot->is_recalling,
+		         (int)(slot->recall_end_tic - sMNPlayersVSTotalTimeTics));
+	}
+	/* Close enough: on the token, or the held token already reads as the
+	 * fighter we want (slot->fkind follows the portrait under the puck). */
+	if (((dx > -3.0F) && (dx < 3.0F) && (dy > -3.0F) && (dy < 3.0F))
+	    || ((slot->cursor_status == nMNPlayersCursorStatusGrab) && (slot->fkind != nFTKindNull)))
+	{
+		if ((sMNPlayersVSTotalTimeTics % 20) == 0)
+		{
+			*buttons = A_BUTTON;
+		}
+		return;
+	}
+	/* Cursor speed is stick/20 per frame (mnPlayersVSCursorProcUpdate). */
+	dx *= 20.0F;
+	dy *= -20.0F;
+	*stick_x = (s8)((dx > 70.0F) ? 70 : (dx < -70.0F) ? -70 : (s32)dx);
+	*stick_y = (s8)((dy > 70.0F) ? 70 : (dy < -70.0F) ? -70 : (s32)dy);
+}
+#endif

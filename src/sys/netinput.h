@@ -108,6 +108,13 @@ extern sb32 syNetInputGetLocalQueuedFrame(s32 player, u32 tick, SYNetInputFrame 
 extern u32 syNetInputGetLocalQueuedCount(s32 player);
 extern u32 syNetInputGetRemoteConfirmedCount(s32 player);
 extern u32 syNetInputGetRemoteLag(void);
+extern void syNetInputSetLocalHardwarePort(s32 port);
+extern sb32 syNetInputGetRemoteFrame(s32 player, u32 tick, SYNetInputFrame *out_frame);
+extern void syNetInputQueueLocalFrame(s32 player, u32 tick);
+extern void syNetInputPublishFrame(s32 player, SYNetInputFrame *frame);
+extern void syNetInputPublishMainController(void);
+extern void syNetInputMakeFrame(SYNetInputFrame *frame, u32 tick, u16 buttons, s8 stick_x, s8 stick_y,
+                                SYNetInputSource source, sb32 is_predicted);
 extern void syNetInputSetResimulating(sb32 is_resimulating);
 extern sb32 syNetInputGetResimulating(void);
 extern void syNetInputSaveState(SYNetInputState *out_state);

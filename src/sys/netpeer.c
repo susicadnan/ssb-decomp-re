@@ -4,6 +4,7 @@
 #include <gr/ground.h>
 #include <sc/scmanager.h>
 #include <sys/netinput.h>
+#include <sys/netmenu.h>
 #include <sys/netreplay.h>
 #include <sys/netstate.h>
 #include <sys/netsync.h>
@@ -23,14 +24,15 @@ extern void port_log(const char *fmt, ...);
 #endif
 
 #define SYNETPEER_MAGIC 0x53534E50 // SSNP
-#define SYNETPEER_VERSION 3 // 3: the spare header u16 carries the sender's frame advantage
+#define SYNETPEER_VERSION 4 // 4: MATCH_CONFIG also carries the host's unlock and fighter masks
 #define SYNETPEER_MAX_PACKET_FRAMES 16
 #define SYNETPEER_FRAME_BYTES 8
 #define SYNETPEER_INPUT_HEADER_BYTES (4 + 2 + 2 + 4 + 4 + 4 + 1 + 1 + 1 + 1)
 #define SYNETPEER_PACKET_BYTES ((SYNETPEER_INPUT_HEADER_BYTES) + ((SYNETPEER_MAX_PACKET_FRAMES) * (SYNETPEER_FRAME_BYTES)) + 4)
 #define SYNETPEER_VALIDATION_INPUT_WINDOW 120
 #define SYNETPEER_METADATA_BYTES (11 * 4 + 8 + (MAXCONTROLLERS * 7))
-#define SYNETPEER_BOOTSTRAP_PACKET_BYTES (4 + 2 + 2 + 4 + SYNETPEER_METADATA_BYTES + 4)
+#define SYNETPEER_BOOTSTRAP_PACKET_BYTES (4 + 2 + 2 + 4 + SYNETPEER_METADATA_BYTES + 4 + 4 + 4)
+#define SYNETPEER_STOP_REPEAT_PACKETS 5
 #define SYNETPEER_CONTROL_PACKET_BYTES (4 + 2 + 2 + 4 + 4)
 #define SYNETPEER_DEFAULT_INPUT_DELAY 2
 #define SYNETPEER_DEFAULT_SESSION_ID 1
@@ -141,6 +143,22 @@ sb32 sSYNetPeerRematchPeer;
 u8 sSYNetPeerRematchLocalFighter;
 u8 sSYNetPeerRematchPeerFighter;
 u32 sSYNetPeerRematchFrames;
+/* In-menu sessions (sys/netmenu.c): the players pick everything in the
+ * game's own VS menus, run in lockstep, and each battle starts with a
+ * blocking exchange of the host's battle state. Every menu phase and every
+ * battle gets its own session id (base + phase) so a packet from the
+ * previous phase can never be taken for one of the current tick space. */
+sb32 sSYNetPeerMenuMode;
+u32 sSYNetPeerSessionBase;
+u32 sSYNetPeerSessionPhase;
+/* The client plays with the host's unlocks for the duration of the session
+ * so both character selects show the same roster; put back afterwards. */
+sb32 sSYNetPeerMasksOverridden;
+u8 sSYNetPeerSavedUnlockMask;
+u16 sSYNetPeerSavedFighterMask;
+u32 sSYNetPeerPeerUnlockMask;
+u32 sSYNetPeerPeerFighterMask;
+extern void port_coroutine_yield(void);
 #endif
 
 u32 syNetPeerChecksumAccumulateU32(u32 checksum, u32 value)
@@ -327,6 +345,14 @@ sb32 syNetPeerCheckMetadata(const SYNetInputReplayMetadata *metadata)
 #ifdef PORT
 void syNetPeerSleepBootstrapRetry(void)
 {
+	/* An in-menu session exchanges the battle state from inside the scene
+	 * start, on the game coroutine: give the frame back to the port so the
+	 * window keeps drawing and pumping events while we wait. */
+	if (sSYNetPeerMenuMode != FALSE)
+	{
+		port_coroutine_yield();
+		return;
+	}
 	port_netsock_sleep_us(SYNETPEER_BOOTSTRAP_RETRY_USECS);
 }
 
@@ -381,6 +407,22 @@ void syNetPeerMakeBootstrapMetadata(SYNetInputReplayMetadata *metadata)
 {
 	s32 player;
 
+#ifdef PORT
+	if (sSYNetPeerMenuMode != FALSE)
+	{
+		/* An in-menu session carries the real battle state: the VS rules
+		 * when the session starts (so both sides enter the menus from the
+		 * host's settings) and, at each battle, the picks the menus made. */
+		syNetReplayCaptureBattleMetadata(&gSCManagerTransferBattleState, metadata);
+		metadata->rng_seed = sSYNetPeerBootstrapSeed;
+
+		if (metadata->player_count == 0)
+		{
+			metadata->player_count = 2;
+		}
+		return;
+	}
+#endif
 	memset(metadata, 0, sizeof(*metadata));
 	metadata->magic = SYNETINPUT_REPLAY_MAGIC;
 	metadata->version = SYNETINPUT_REPLAY_VERSION;
@@ -450,6 +492,22 @@ void syNetPeerApplyBootstrapMetadata(const SYNetInputReplayMetadata *metadata)
 	sSYNetPeerBootstrapMetadata = *metadata;
 	syNetReplayApplyBattleMetadata(&sSYNetPeerBootstrapMetadata);
 	syUtilsSetRandomSeed(sSYNetPeerBootstrapMetadata.rng_seed);
+#ifdef PORT
+	if (sSYNetPeerMenuMode != FALSE)
+	{
+		/* The menus decide which scene comes next. Keep the host's stage
+		 * select setting (the replay path forces it off) and name the stage
+		 * for the battle scene that may be starting right now. */
+		gSCManagerTransferBattleState.is_stage_select = metadata->is_stage_select;
+		gSCManagerSceneData.gkind = metadata->stage_kind;
+		sSYNetPeerBootstrapMetadataApplied = TRUE;
+		port_log("SSB64 NetPeer: battle state applied host=%d stage=%u seed=%u rules=%u stocks=%u time=%u p0=%u/%u p1=%u/%u\n",
+		         sSYNetPeerBootstrapIsHost, metadata->stage_kind, metadata->rng_seed, metadata->game_rules,
+		         metadata->stocks, metadata->time_limit, metadata->player_kinds[0], metadata->fighter_kinds[0],
+		         metadata->player_kinds[1], metadata->fighter_kinds[1]);
+		return;
+	}
+#endif
 	gSCManagerSceneData.scene_prev = nSCKindVSMode;
 	gSCManagerSceneData.scene_curr = nSCKindVSBattle;
 	sSYNetPeerBootstrapMetadataApplied = TRUE;
@@ -560,6 +618,8 @@ void syNetPeerSendMatchConfigPacket(void)
 	syNetPeerWriteU16(&cursor, SYNETPEER_PACKET_MATCH_CONFIG);
 	syNetPeerWriteU32(&cursor, sSYNetPeerSessionID);
 	syNetPeerWriteMetadata(&cursor, &sSYNetPeerBootstrapMetadata);
+	syNetPeerWriteU32(&cursor, gSCManagerBackupData.unlock_mask);
+	syNetPeerWriteU32(&cursor, gSCManagerBackupData.fighter_mask);
 	checksum = syNetPeerChecksumBytes(buffer, cursor - buffer);
 	syNetPeerWriteU32(&cursor, checksum);
 	syNetPeerSendBytes(buffer, SYNETPEER_BOOTSTRAP_PACKET_BYTES);
@@ -629,6 +689,8 @@ void syNetPeerHandleMatchConfigPacket(const u8 *buffer, s32 size)
 	SYNetInputReplayMetadata metadata;
 	u32 magic;
 	u32 session_id;
+	u32 unlock_mask;
+	u32 fighter_mask;
 	u32 checksum;
 	u32 expected_checksum;
 	u16 version;
@@ -645,6 +707,8 @@ void syNetPeerHandleMatchConfigPacket(const u8 *buffer, s32 size)
 	packet_type = syNetPeerReadU16(&cursor);
 	session_id = syNetPeerReadU32(&cursor);
 	syNetPeerReadMetadata(&cursor, &metadata);
+	unlock_mask = syNetPeerReadU32(&cursor);
+	fighter_mask = syNetPeerReadU32(&cursor);
 	checksum = syNetPeerReadU32(&cursor);
 
 	if ((magic != SYNETPEER_MAGIC) || (version != SYNETPEER_VERSION) ||
@@ -657,6 +721,19 @@ void syNetPeerHandleMatchConfigPacket(const u8 *buffer, s32 size)
 	}
 	if (sSYNetPeerBootstrapIsHost == FALSE)
 	{
+#ifdef PORT
+		if (sSYNetPeerMenuMode != FALSE)
+		{
+			if (sSYNetPeerMasksOverridden == FALSE)
+			{
+				sSYNetPeerSavedUnlockMask = gSCManagerBackupData.unlock_mask;
+				sSYNetPeerSavedFighterMask = gSCManagerBackupData.fighter_mask;
+				sSYNetPeerMasksOverridden = TRUE;
+			}
+			gSCManagerBackupData.unlock_mask = (u8)unlock_mask;
+			gSCManagerBackupData.fighter_mask = (u16)fighter_mask;
+		}
+#endif
 		syNetPeerApplyBootstrapMetadata(&metadata);
 	}
 }
@@ -681,17 +758,19 @@ void syNetPeerReceiveBootstrapPackets(void)
 	syNetPeerReceiveAll(syNetPeerHandleBootstrapPacket, buffer, sizeof(buffer));
 }
 
-void syNetPeerRunBootstrap(void)
+/* Blocking exchange of the match config. TRUE once both sides hold it (host:
+ * READY seen and START sent; client: MATCH_CONFIG applied and START seen). */
+sb32 syNetPeerRunBootstrap(void)
 {
 	s32 i;
 
 	if ((sSYNetPeerBootstrapIsEnabled == FALSE) || (sSYNetPeerIsConfigured == FALSE))
 	{
-		return;
+		return FALSE;
 	}
 	if (syNetPeerOpenSocket() == FALSE)
 	{
-		return;
+		return FALSE;
 	}
 	sSYNetPeerIsActive = TRUE;
 
@@ -714,7 +793,7 @@ void syNetPeerRunBootstrap(void)
 		if (sSYNetPeerBootstrapPeerReady == FALSE)
 		{
 			port_log("SSB64 NetPeer: bootstrap host timed out waiting for READY\n");
-			return;
+			return FALSE;
 		}
 		for (i = 0; i < 30; i++)
 		{
@@ -740,7 +819,7 @@ void syNetPeerRunBootstrap(void)
 		if (sSYNetPeerBootstrapMetadataApplied == FALSE)
 		{
 			port_log("SSB64 NetPeer: bootstrap client timed out waiting for MATCH_CONFIG\n");
-			return;
+			return FALSE;
 		}
 		for (i = 0; i < SYNETPEER_BOOTSTRAP_RETRY_COUNT; i++)
 		{
@@ -756,10 +835,44 @@ void syNetPeerRunBootstrap(void)
 		if (sSYNetPeerBootstrapStartReceived == FALSE)
 		{
 			port_log("SSB64 NetPeer: bootstrap client timed out waiting for START\n");
-			return;
+			return FALSE;
 		}
 		port_log("SSB64 NetPeer: bootstrap client received START stage=%u seed=%u\n",
 		         sSYNetPeerBootstrapMetadata.stage_kind, sSYNetPeerBootstrapMetadata.rng_seed);
+	}
+	return TRUE;
+}
+
+/* A new tick space: the next menu phase or the next battle of an in-menu
+ * session. Both sides call this at the same point of the same flow. */
+void syNetPeerBeginPhase(void)
+{
+	sSYNetPeerSessionPhase++;
+	sSYNetPeerSessionID = sSYNetPeerSessionBase + sSYNetPeerSessionPhase;
+	sSYNetPeerBootstrapMetadataApplied = FALSE;
+	sSYNetPeerBootstrapPeerReady = FALSE;
+	sSYNetPeerBootstrapStartReceived = FALSE;
+	sSYNetPeerHighestRemoteTick = 0;
+	sSYNetPeerRecvSeqInitialized = FALSE;
+	sSYNetPeerLastPacketTicksValid = FALSE;
+	sSYNetPeerRemoteAdvantageValid = FALSE;
+	sSYNetPeerSendSeq = 0;
+	sSYNetPeerPingFrames = 0;
+}
+
+sb32 syNetPeerCheckMenuMode(void)
+{
+	return sSYNetPeerMenuMode;
+}
+
+/* PING every half second; the HUD shows the round trip. The battle calls
+ * this from syNetPeerUpdate, the menus from sys/netmenu.c. */
+void syNetPeerSendPeriodicPing(void)
+{
+	if (++sSYNetPeerPingFrames >= SYNETPEER_PING_INTERVAL_FRAMES)
+	{
+		sSYNetPeerPingFrames = 0;
+		syNetPeerSendPingPacket(SYNETPEER_PACKET_PING, port_netsock_now_ms());
 	}
 }
 #endif
@@ -797,6 +910,17 @@ void syNetPeerResetConfig(void)
 	sSYNetPeerPostMatch = FALSE;
 	sSYNetPeerRematchLocal = FALSE;
 	sSYNetPeerRematchPeer = FALSE;
+	sSYNetPeerMenuMode = FALSE;
+	sSYNetPeerSessionBase = SYNETPEER_DEFAULT_SESSION_ID;
+	sSYNetPeerSessionPhase = 0;
+	syNetMenuStop();
+
+	if (sSYNetPeerMasksOverridden != FALSE)
+	{
+		gSCManagerBackupData.unlock_mask = sSYNetPeerSavedUnlockMask;
+		gSCManagerBackupData.fighter_mask = sSYNetPeerSavedFighterMask;
+		sSYNetPeerMasksOverridden = FALSE;
+	}
 }
 
 /* ---- Lobby-driven sessions (port/netplay/lobby.cpp) ----
@@ -804,16 +928,23 @@ void syNetPeerResetConfig(void)
  * socket and the match parameters over here, then calls syNetPeerLobbyStep()
  * once per frame until it reports done, and only then moves the game into
  * nSCKindVSBattle. This is the per-frame form of syNetPeerRunBootstrap's
- * blocking loop; the packets are the same. Host = player 0, client = 1. */
+ * blocking loop; the packets are the same. Host = player 0, client = 1.
+ *
+ * With menu_mode the picks are ignored: the config exchanged carries the
+ * host's VS rules, and once it is through both players are dropped into the
+ * VS menu in lockstep (sys/netmenu.c) to pick everything there. */
 void syNetPeerLobbyConfigure(intptr_t sock, const PortNetAddr *peer, sb32 is_host, u32 delay, u32 session_id,
                              u32 seed, u8 host_fighter, u8 client_fighter, u32 stage_kind, u32 stocks,
-                             u32 time_minutes)
+                             u32 time_minutes, sb32 menu_mode)
 {
 	if (sSYNetPeerSocket != sock)
 	{
 		syNetPeerCloseSocket();
 	}
 	syNetPeerResetConfig();
+	sSYNetPeerMenuMode = menu_mode;
+	sSYNetPeerSessionBase = (session_id != 0) ? session_id : SYNETPEER_DEFAULT_SESSION_ID;
+	sSYNetPeerSessionPhase = 0;
 	sSYNetPeerLobbySession = TRUE;
 	sSYNetPeerLobbyDelay = delay;
 	sSYNetPeerLobbyStage = stage_kind;
@@ -829,7 +960,7 @@ void syNetPeerLobbyConfigure(intptr_t sock, const PortNetAddr *peer, sb32 is_hos
 	sSYNetPeerBootstrapIsEnabled = TRUE;
 	sSYNetPeerBootstrapIsHost = is_host;
 	sSYNetPeerBootstrapSeed = (seed != 0) ? seed : SYNETPEER_DEFAULT_BOOTSTRAP_SEED;
-	sSYNetPeerLobbyHasPicks = TRUE;
+	sSYNetPeerLobbyHasPicks = (menu_mode == FALSE) ? TRUE : FALSE;
 	sSYNetPeerLobbyFighters[0] = host_fighter;
 	sSYNetPeerLobbyFighters[1] = client_fighter;
 	sSYNetPeerLobbyStageKind = stage_kind;
@@ -848,8 +979,8 @@ void syNetPeerLobbyConfigure(intptr_t sock, const PortNetAddr *peer, sb32 is_hos
 		syNetPeerMakeBootstrapMetadata(&sSYNetPeerBootstrapMetadata);
 		syNetPeerApplyBootstrapMetadata(&sSYNetPeerBootstrapMetadata);
 	}
-	port_log("SSB64 NetPeer: lobby session role=%s delay=%u session=%u seed=%u fighters=%u/%u stage=%u stocks=%u time=%u\n",
-	         (is_host != FALSE) ? "host" : "client", delay, sSYNetPeerSessionID, sSYNetPeerBootstrapSeed,
+	port_log("SSB64 NetPeer: lobby session role=%s delay=%u session=%u seed=%u menus=%d fighters=%u/%u stage=%u stocks=%u time=%u\n",
+	         (is_host != FALSE) ? "host" : "client", delay, sSYNetPeerSessionID, sSYNetPeerBootstrapSeed, menu_mode,
 	         host_fighter, client_fighter, stage_kind, stocks, time_minutes);
 }
 
@@ -924,6 +1055,18 @@ s32 syNetPeerLobbyStep(void)
 		         (sSYNetPeerBootstrapIsHost != FALSE) ? "host" : "client", sSYNetPeerBootstrapMetadata.stage_kind,
 		         sSYNetPeerBootstrapMetadata.rng_seed);
 		sSYNetPeerLobbyActive = FALSE;
+
+		if (sSYNetPeerMenuMode != FALSE)
+		{
+			/* Both players leave whatever they were doing for the VS menu
+			 * and run it in lockstep from its first frame. Same seed on both
+			 * sides, so a random pick in the character select agrees too. */
+			syNetPeerBeginPhase();
+			syUtilsSetRandomSeed(sSYNetPeerBootstrapSeed);
+			syNetMenuStart(sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer, sSYNetPeerInputDelay, nSCKindVSMode);
+			portSCManagerRequestResetTo(nSCKindVSMode, nSCKindModeSelect);
+			return 1;
+		}
 		/* Both players leave whatever menu they are in for the battle; the
 		 * battle state itself was written by syNetPeerApplyBootstrapMetadata. */
 		portSCManagerRequestResetTo(nSCKindVSBattle, nSCKindVSMode);
@@ -935,6 +1078,8 @@ s32 syNetPeerLobbyStep(void)
 void syNetPeerLobbyAbort(void)
 {
 	sSYNetPeerLobbyActive = FALSE;
+	sSYNetPeerMenuMode = FALSE; /* so the stop below does not re-arm the menus */
+	syNetMenuStop();
 	syNetPeerStopVSSession();
 	syNetPeerCloseSocket();
 	syNetPeerResetConfig();
@@ -1003,7 +1148,7 @@ s32 syNetPeerRematchStep(void)
 		syNetPeerSendPingPacket(SYNETPEER_PACKET_REMATCH, sSYNetPeerRematchLocalFighter);
 		syNetPeerLobbyConfigure(sSYNetPeerSocket, &sSYNetPeerPeerAddress, is_host, sSYNetPeerLobbyDelay,
 		                        sSYNetPeerSessionID, seed, host_fighter, client_fighter, sSYNetPeerLobbyStage,
-		                        sSYNetPeerLobbyStocks, sSYNetPeerLobbyTimeMinutes);
+		                        sSYNetPeerLobbyStocks, sSYNetPeerLobbyTimeMinutes, FALSE);
 		return 1;
 	}
 	return 0;
@@ -1021,6 +1166,8 @@ void syNetPeerAbortMatch(const char *reason)
 	port_log("SSB64 NetPeer: match aborted: %s\n", reason);
 	syNetStateStopVSSession();
 	sSYNetPeerLobbySession = FALSE; /* no rematch after a lost connection */
+	sSYNetPeerMenuMode = FALSE;
+	syNetMenuStop();
 	syNetPeerStopVSSession();
 	syNetPeerCloseSocket();
 	syNetPeerResetConfig();
@@ -1138,6 +1285,25 @@ void syNetPeerStartVSSession(void)
 	{
 		return;
 	}
+	if (sSYNetPeerMenuMode != FALSE)
+	{
+		if (sSYNetPeerIsActive == FALSE)
+		{
+			return; /* the session ended while the menus were running */
+		}
+		/* The menus brought both players here; now the host's battle state
+		 * (its picks, rules and stage) becomes the one true one, exchanged
+		 * before either side builds a fighter. New tick space for the
+		 * battle; stale menu packets carry the old session id. */
+		syNetMenuStop();
+		syNetPeerBeginPhase();
+
+		if (syNetPeerRunBootstrap() == FALSE)
+		{
+			syNetPeerAbortMatch("the other player did not start the match");
+			return;
+		}
+	}
 	sSYNetPeerHighestRemoteTick = 0;
 	sSYNetPeerPacketsSent = 0;
 	sSYNetPeerPacketsReceived = 0;
@@ -1173,6 +1339,8 @@ void syNetPeerStartVSSession(void)
 	syNetInputSetSlotSource(sSYNetPeerLocalPlayer, nSYNetInputSourceLocal);
 	syNetInputSetSlotSource(sSYNetPeerRemotePlayer, nSYNetInputSourceRemotePredicted);
 	syNetInputSetLocalDelay(sSYNetPeerInputDelay);
+	/* The client is player 2 but holds its controller in port 1. */
+	syNetInputSetLocalHardwarePort((gSYControllerDeviceStatuses[0] >= 0) ? gSYControllerDeviceStatuses[0] : 0);
 
 	port_log("SSB64 NetPeer: VS session start role=%s local=%d remote=%d delay=%u barrier=%d tick=%u\n",
 	         (sSYNetPeerBootstrapIsHost != FALSE) ? "host" : "client",
@@ -1665,11 +1833,7 @@ void syNetPeerUpdate(void)
 	}
 	syNetPeerSendLocalInput();
 #ifdef PORT
-	if (++sSYNetPeerPingFrames >= SYNETPEER_PING_INTERVAL_FRAMES)
-	{
-		sSYNetPeerPingFrames = 0;
-		syNetPeerSendPingPacket(SYNETPEER_PACKET_PING, port_netsock_now_ms());
-	}
+	syNetPeerSendPeriodicPing();
 #endif
 	syNetPeerLogStats();
 }
@@ -1734,6 +1898,22 @@ void syNetPeerStopVSSession(void)
 		port_log("SSB64 NetPeer: VS session stop sent=%u recv=%u dropped=%u staged=%u late=%u checksum=0x%08X\n",
 		         sSYNetPeerPacketsSent, sSYNetPeerPacketsReceived, sSYNetPeerPacketsDropped,
 		         sSYNetPeerFramesStaged, sSYNetPeerLateFrames, sSYNetPeerInputChecksum);
+	}
+	if ((sSYNetPeerMenuMode != FALSE) && (sSYNetPeerIsActive != FALSE))
+	{
+		s32 i;
+
+		/* The peer may still be a few ticks short of the end: repeat the last
+		 * input packet, since nothing retransmits once the battle is gone. */
+		for (i = 0; i < SYNETPEER_STOP_REPEAT_PACKETS; i++)
+		{
+			syNetPeerSendLocalInput();
+		}
+		/* Back to the menus (results, then the character select) in
+		 * lockstep; the connection stays up for the next game. */
+		syNetPeerBeginPhase();
+		syNetMenuStart(sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer, sSYNetPeerInputDelay, -1);
+		return;
 	}
 	if ((sSYNetPeerLobbySession != FALSE) && (sSYNetPeerIsActive != FALSE) && (sSYNetPeerPostMatch == FALSE))
 	{

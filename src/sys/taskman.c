@@ -11,6 +11,7 @@
 #include <sys/controller.h>
 #ifdef PORT
 #include <sys/netstate.h>
+#include <sys/netmenu.h>
 #include <netstate_optin.h>
 #else
 #define SYNET_HOST_VAR
@@ -1187,10 +1188,31 @@ void syTaskmanRunTask(SYTaskFunction *tfunc)
 	D_800454BC = 2;
 }
 
+#ifdef PORT
+/* Netplay in the menus (sys/netmenu.c): while a lockstep session is active
+ * the scene's own controller function is replaced by one that publishes both
+ * players' inputs for this tick, and the tick is skipped (same frame drawn
+ * again) until the peer's input for it has arrived. */
+static sb32 syTaskmanReadControllers(void)
+{
+	if (syNetMenuCheckActive() != FALSE)
+	{
+		return syNetMenuFuncRead();
+	}
+	sSYTaskmanFuncController();
+	return TRUE;
+}
+#else
+#define syTaskmanReadControllers() (sSYTaskmanFuncController(), TRUE)
+#endif
+
 // 0x800062B4
 void func_800062B4(SYTaskFunction *tfunc)
 {
-	sSYTaskmanFuncController();
+	if (syTaskmanReadControllers() == FALSE)
+	{
+		return;
+	}
 	tfunc->scene_update();
 }
 
@@ -1210,7 +1232,10 @@ void func_800062EC(SYTaskFunction *tfunc)
 // 0x80006350
 void syTaskmanCommonTaskUpdate(SYTaskFunction *tfunc)
 {
-	sSYTaskmanFuncController();
+	if (syTaskmanReadControllers() == FALSE)
+	{
+		return;
+	}
 	tfunc->scene_update();
 
 	if (syTaskmanCheckBreakLoop() != FALSE)

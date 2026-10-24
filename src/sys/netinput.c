@@ -58,6 +58,11 @@ u32 sSYNetInputRemoteConfirmedCount[MAXCONTROLLERS];
  * synthetic input pattern instead of polling hardware, so two headless
  * instances exercise mispredictions, rollbacks and the gameplay hash. */
 sb32 sSYNetInputFakeLocal;
+/* Which physical controller port feeds the local slot in a netplay session.
+ * The local player's slot is 0 on the host and 1 on the client, but both of
+ * them hold their only controller in port 0; -1 = the slot's own port
+ * (offline: every slot is its own controller). */
+s32 sSYNetInputLocalHardwarePort = -1;
 
 #ifdef PORT
 extern char *getenv(const char *name);
@@ -271,7 +276,8 @@ void syNetInputSetSavedInput(s32 player, u32 tick, u16 buttons, s8 stick_x, s8 s
 
 void syNetInputMakeLocalFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
 {
-	SYController *controller = &gSYControllerDevices[player];
+	s32 port = (sSYNetInputLocalHardwarePort >= 0) ? sSYNetInputLocalHardwarePort : player;
+	SYController *controller = &gSYControllerDevices[port];
 
 	if (sSYNetInputFakeLocal != FALSE)
 	{
@@ -284,7 +290,11 @@ void syNetInputMakeLocalFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
 		s8 stick_x = 0;
 		s8 stick_y = 0;
 
-		switch ((h >> 8) & 7U)
+		/* Every special (neutral, side, up, down B), smash and tilt
+		 * attacks, jumps, shield and roll: enough to reach each fighter's
+		 * state machine, not just walking and jabbing. Bits: A 0x8000,
+		 * B 0x4000, Z 0x2000, R 0x0010, C-up 0x0008. */
+		switch ((h >> 8) & 15U)
 		{
 		case 0: stick_x = 60; break;
 		case 1: stick_x = -60; break;
@@ -292,6 +302,15 @@ void syNetInputMakeLocalFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
 		case 3: buttons = 0x4000; stick_x = 60; break;
 		case 4: stick_y = 60; break;
 		case 5: buttons = 0x8000; stick_x = -60; break;
+		case 6: buttons = 0x4000; stick_y = 70; break;   /* up+B */
+		case 7: buttons = 0x4000; break;                 /* neutral B */
+		case 8: buttons = 0x4000; stick_y = -70; break;  /* down+B */
+		case 9: buttons = 0x8000; stick_y = -70; break;  /* down smash / tilt */
+		case 10: buttons = 0x0008; stick_x = 40; break;  /* C jump drifting */
+		case 11: buttons = 0x0010; break;                /* shield */
+		case 12: buttons = 0x0010; stick_x = -60; break; /* roll */
+		case 13: buttons = 0x2000; break;                /* Z: grab */
+		case 14: stick_y = -70; break;                   /* crouch / platform drop */
 		default: break;
 		}
 		syNetInputMakeFrame(out_frame, tick, buttons, stick_x, stick_y, nSYNetInputSourceLocal, FALSE);
@@ -791,6 +810,16 @@ u32 syNetInputGetRemoteLag(void)
 		}
 	}
 	return lag;
+}
+
+void syNetInputSetLocalHardwarePort(s32 port)
+{
+	sSYNetInputLocalHardwarePort = ((port >= 0) && (port < MAXCONTROLLERS)) ? port : -1;
+}
+
+sb32 syNetInputGetRemoteFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
+{
+	return syNetInputGetStoredFrame(sSYNetInputRemoteHistory, player, tick, out_frame);
 }
 
 void syNetInputSetResimulating(sb32 is_resimulating)
