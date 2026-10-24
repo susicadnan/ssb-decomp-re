@@ -11,6 +11,7 @@
 
 #include <coroutine.h>
 #include <netstate_coro.h>
+#include <netstate_host.h>
 
 /*
  * Simulation snapshot/restore and the rollback driver. See netstate.h for
@@ -53,6 +54,10 @@ typedef struct SYNetStateSlot
 	size_t coro_blob_used;
 
 	SYNetInputState input;
+
+	/* Port-side bookkeeping about the arena bytes (byte-order fixups, reloc
+	 * file registry, token table); see port/netstate_host.h. */
+	void *host;
 
 } SYNetStateSlot;
 
@@ -166,6 +171,7 @@ static void syNetStateFreeSlots(void)
 		free(slot->arena);
 		free(slot->globals);
 		free(slot->coro_blobs);
+		port_netstate_host_free(slot->host);
 		memset(slot, 0, sizeof(*slot));
 	}
 }
@@ -310,6 +316,7 @@ void syNetStateStartVSSession(void)
 	sSYNetStateMaxArenaUsed = 0;
 
 	port_gobj_coroutine_set_rollback_active(1, syNetStateCoroTickFn);
+	port_netstate_host_begin();
 
 	syNetStateLog("SSB64 NetState: session start slots=%u globals=%zu bytes (%d ranges) arena_used=%zu synctest=%u\n",
 	              sSYNetStateSlotCount, sSYNetStateGlobalsBytes, sSYNetStateRangeCount, syNetStateGetArenaUsed(),
@@ -327,6 +334,7 @@ void syNetStateStopVSSession(void)
 	syNetInputSetResimulating(FALSE);
 
 	port_gobj_coroutine_set_rollback_active(0, NULL);
+	port_netstate_host_end();
 
 	sSYNetStateLogCount = 0;
 	syNetStateLog("SSB64 NetState: session end saves=%u rollbacks=%u resim_ticks=%u max_depth=%u too_old=%u "
@@ -386,6 +394,8 @@ sb32 syNetStateSave(u32 tick)
 	}
 	slot = &sSYNetStateSlots[tick % sSYNetStateSlotCount];
 	slot->is_valid = FALSE;
+	port_netstate_host_free(slot->host);
+	slot->host = NULL;
 
 	/* Arena: only the bump-allocated prefix is live. */
 	arena_used = syNetStateGetArenaUsed();
@@ -444,6 +454,7 @@ sb32 syNetStateSave(u32 tick)
 		slot->coro_blob_used += blob_size;
 	}
 	syNetInputSaveState(&slot->input);
+	slot->host = port_netstate_host_save();
 
 	slot->tick = tick;
 	slot->is_valid = TRUE;
@@ -453,6 +464,15 @@ sb32 syNetStateSave(u32 tick)
 	if (tick + 1 >= sSYNetStateSlotCount)
 	{
 		port_gobj_coroutine_collect(tick + 1 - sSYNetStateSlotCount);
+	}
+	/* Likewise, host-side journal history older than the oldest snapshot. */
+	{
+		SYNetStateSlot *oldest = syNetStateFindSlot(syNetStateGetOldestTick());
+
+		if (oldest != NULL)
+		{
+			port_netstate_host_trim(oldest->host);
+		}
 	}
 	return TRUE;
 }
@@ -477,6 +497,13 @@ sb32 syNetStateRestore(u32 tick)
 	/* Measure before the globals restore moves the bump pointer back. */
 	arena_used_now = syNetStateGetArenaUsed();
 
+	/* Port bookkeeping about the arena bytes must agree with the bytes we
+	 * are about to put back; it is independent of them, so order does not
+	 * matter, but a failure here means the restore is incomplete. */
+	if (port_netstate_host_restore(slot->host) == 0)
+	{
+		syNetStateLog("SSB64 NetState: host-side state for tick %u is gone — restore incomplete\n", tick);
+	}
 	memcpy(gPortSceneHeap, slot->arena, slot->arena_used);
 
 	/* The arena was zeroed at scene start and the bump allocator never
