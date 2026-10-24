@@ -51,6 +51,7 @@ extern int syNetStateSectionGetRanges(void **starts, size_t *sizes, int max_rang
 
 #define SYNETSTATE_RANGES_MAX 4
 #define SYNETSTATE_LOG_LIMIT 32
+#define SYNETSTATE_DISCONNECT_FRAMES 600
 
 typedef struct SYNetStateSlot
 {
@@ -103,6 +104,7 @@ static u32 sSYNetStateRollbackTooOldCount;
 static u32 sSYNetStateSyncTestRuns;
 static u32 sSYNetStateSyncTestMismatches;
 static u32 sSYNetStateStallCount;
+static u32 sSYNetStateStallRun;       /* consecutive stalled frames */
 static u32 sSYNetStateTimeSyncSkips;
 static u32 sSYNetStateTimeSyncCooldown;
 static u32 sSYNetStateLogCount;
@@ -345,6 +347,7 @@ void syNetStateStartVSSession(void)
 	sSYNetStateSyncTestRuns = 0;
 	sSYNetStateSyncTestMismatches = 0;
 	sSYNetStateStallCount = 0;
+	sSYNetStateStallRun = 0;
 	sSYNetStateTimeSyncSkips = 0;
 	sSYNetStateTimeSyncCooldown = 0;
 	sSYNetStateLogCount = 0;
@@ -718,15 +721,27 @@ void syNetStateRunTick(void (*task_update)(void *), void *tfunc)
 	{
 		sSYNetStateDiagPhase = nSYNetStatePhaseStall;
 		sSYNetStateStallCount++;
+		sSYNetStateStallRun++;
 
 		if ((sSYNetStateStallCount % 60) == 1)
 		{
 			syNetStateLog("SSB64 NetState: stalling at tick %u, remote lag %u >= slots %u (stalls=%u)\n", cur,
 			              syNetInputGetRemoteLag(), sSYNetStateSlotCount, sSYNetStateStallCount);
 		}
+		/* Ten seconds without a single input from the peer: they are gone.
+		 * netpeer ends the match and sends everyone back to the menu. */
+		if (sSYNetStateStallRun >= SYNETSTATE_DISCONNECT_FRAMES)
+		{
+			port_log("SSB64 NetState: no input from the peer for %u frames at tick %u — disconnecting\n",
+			         sSYNetStateStallRun, cur);
+			sSYNetStateStallRun = 0;
+			syNetPeerAbortMatch("connection lost");
+			return;
+		}
 		syNetPeerPumpWhileStalled();
 		return;
 	}
+	sSYNetStateStallRun = 0;
 	/* Time sync: when we are further ahead of the peer than they are of us
 	 * by more than a frame, give one tick back now and then (at most one
 	 * per 20) so both machines run in step and predictions stay shallow,

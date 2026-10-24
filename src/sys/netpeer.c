@@ -889,6 +889,23 @@ void syNetPeerLobbyAbort(void)
 	syNetPeerStopVSSession();
 	syNetPeerResetConfig();
 }
+
+/* The match cannot continue (peer gone, or they quit): tear the session
+ * down, tell the lobby why, and send the player back to the VS menu. Safe
+ * to call from inside the tick: the scene change lands at the next frame
+ * boundary like the console-reset path. */
+void syNetPeerAbortMatch(const char *reason)
+{
+	extern void portSCManagerRequestResetTo(s32 scene, s32 scene_prev);
+	extern void port_lobby_notify_match_over(const char *reason);
+
+	port_log("SSB64 NetPeer: match aborted: %s\n", reason);
+	syNetStateStopVSSession();
+	syNetPeerStopVSSession();
+	syNetPeerResetConfig();
+	port_lobby_notify_match_over(reason);
+	portSCManagerRequestResetTo(nSCKindVSMode, nSCKindVSMode);
+}
 #endif
 
 void syNetPeerInitDebugEnv(void)
