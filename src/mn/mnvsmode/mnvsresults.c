@@ -14,7 +14,10 @@ extern void* func_800269C0_275C0(u16);
 #ifdef PORT
 extern float port_widescreen_clip_x_scale(void);
 extern const char* syNetPeerGetSlotName(s32 slot);
-#define MNVSRESULTS_PORT_TAG_NAME_SCALE 0.3F
+extern Sprite* portNetplayNameTagSprite(const char *name);
+/* Size of the ROM's 1P..4P tags, which the name tag stands in for. */
+#define MNVSRESULTS_PORT_TAG_WIDTH 19.0F
+#define MNVSRESULTS_PORT_TAG_HEIGHT 24.0F
 #include "fighter_registry.h"
 #endif
 
@@ -1168,9 +1171,7 @@ void mnVSResultsMakePlayerTag(s32 player, s32 color_id)
 	};
 
 #ifdef PORT
-	const char *name = NULL;
-	f32 name_width = 0.0F;
-	f32 name_height = 0.0F;
+	Sprite *name_tag = NULL;
 #endif
 
 	gobj = gcMakeGObjSPAfter(0, NULL, 18, GOBJ_PRIORITY_DEFAULT);
@@ -1178,6 +1179,16 @@ void mnVSResultsMakePlayerTag(s32 player, s32 color_id)
 
 	if (gSCManagerTransferBattleState.players[player].pkind == nFTPlayerKindMan)
 	{
+#ifdef PORT
+		/* Online: the player's name tag instead of 1P..4P. */
+		name_tag = portNetplayNameTagSprite(syNetPeerGetSlotName(player));
+
+		if (name_tag != NULL)
+		{
+			sobj = lbCommonMakeSObjForGObj(gobj, name_tag);
+		}
+		else
+#endif
 		sobj = lbCommonMakeSObjForGObj(gobj, lbRelocGetFileData(Sprite*, sMNVSResultsFiles[1], offsets[player]));
 		sobj->sprite.attr &= ~SP_FASTCOPY;
 		sobj->sprite.attr |= SP_TRANSPARENT;
@@ -1187,17 +1198,6 @@ void mnVSResultsMakePlayerTag(s32 player, s32 color_id)
 		sobj->sprite.red = dIFCommonPlayerTagPrimColorsR[color_id];
 		sobj->sprite.green = dIFCommonPlayerTagPrimColorsG[color_id];
 		sobj->sprite.blue = dIFCommonPlayerTagPrimColorsB[color_id];
-#ifdef PORT
-		/* Online: the player's name instead of 1P..4P. */
-		name = syNetPeerGetSlotName(player);
-
-		if (name != NULL)
-		{
-			sobj->sprite.attr |= SP_HIDDEN;
-			name_width = ifCommonPortNameMakeSObjs(gobj, name, sMNVSResultsFiles[6], sMNVSResultsFiles[5],
-			                                       MNVSRESULTS_PORT_TAG_NAME_SCALE, sobj, &name_height);
-		}
-#endif
 	}
 	else
 	{
@@ -1215,17 +1215,12 @@ void mnVSResultsMakePlayerTag(s32 player, s32 color_id)
 	mnVSResultsSetPlayerTagPosition(gobj, player);
 
 #ifdef PORT
-	/* The name sits centred on where the label would be, on its baseline. */
-	if (name != NULL)
+	/* Same bottom centre as the label it replaces. */
+	if (name_tag != NULL)
 	{
 		sobj = SObjGetStruct(gobj);
-
-		ifCommonPortNamePlace
-		(
-			sobj->next,
-			(sobj->pos.x + (sobj->sprite.width * 0.5F)) - (name_width * 0.5F),
-			(sobj->pos.y + sobj->sprite.height) - name_height
-		);
+		sobj->pos.x += (s32)((MNVSRESULTS_PORT_TAG_WIDTH - sobj->sprite.width) * 0.5F);
+		sobj->pos.y += (s32)(MNVSRESULTS_PORT_TAG_HEIGHT - sobj->sprite.height);
 	}
 #endif
 }

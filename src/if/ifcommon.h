@@ -57,14 +57,6 @@ extern void ifCommonPlayerArrowsInitInterface(void);
 extern void ifCommonPlayerArrowsUpdateFlags(f32 x, f32 y);
 extern void ifCommonPlayerTagProcDisplay(GObj *interface_gobj);
 extern void ifCommonPlayerTagMakeInterface(void);
-#ifdef PORT
-/* Online names in place of the 1P..4P labels (see ifcommon.c). */
-#define IFCOMMON_PORT_NAME_GLYPHS_MAX 12
-#define IFCOMMON_PORT_TAG_NAME_SCALE 0.3F
-extern f32 ifCommonPortNameMakeSObjs(GObj *gobj, const char *name, void *letters_file, void *digits_file, f32 scale,
-                                     const SObj *colors_from, f32 *height);
-extern void ifCommonPortNamePlace(SObj *first, f32 x, f32 y);
-#endif
 extern void ifCommonItemArrowProcDisplay(GObj *interface_gobj);
 extern GObj* ifCommonItemArrowMakeInterface(ITStruct *ip);
 extern void ifCommonItemArrowSetAttr(void);
