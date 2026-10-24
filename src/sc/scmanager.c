@@ -1890,12 +1890,28 @@ void scManagerRunPrintGObjStatus(void)
 static ub32 sPortResetPending = FALSE;
 static s32 sPortResetTarget = nSCKindOpeningRoom;
 
+static s32 sPortResetPrev = nSCKindOpeningRoom;
+
+void portSCManagerRequestResetTo(s32 scene, s32 scene_prev);
+
 void portSCManagerRequestReset(void)
 {
-	extern void func_800266A0_272A0(void); /* audio wind-down used by every scene exit */
 	extern int port_enhancement_boot_to_vs_css(void);
+	s32 target = port_enhancement_boot_to_vs_css() ? nSCKindPlayersVS : nSCKindOpeningRoom;
 
-	sPortResetTarget = port_enhancement_boot_to_vs_css() ? nSCKindPlayersVS : nSCKindOpeningRoom;
+	portSCManagerRequestResetTo(target, target);
+}
+
+/* Same mechanism aimed at a specific scene. Netplay (sys/netpeer.c lobby
+ * path) uses it to drop both players into nSCKindVSBattle once the match
+ * config has been exchanged, from wherever in the menus they were;
+ * scene_prev is what the target scene expects to have come from. */
+void portSCManagerRequestResetTo(s32 scene, s32 scene_prev)
+{
+	extern void func_800266A0_272A0(void); /* audio wind-down used by every scene exit */
+
+	sPortResetTarget = scene;
+	sPortResetPrev = scene_prev;
 	sPortResetPending = TRUE;
 
 	/* Speak the game's native match-abort language: is_reset is what the
@@ -1910,7 +1926,7 @@ void portSCManagerRequestReset(void)
 
 	/* Boot-like state: prev == curr == target (same as the default scene
 	 * data and the Boot-to-CSS override at the top of scManagerRunLoop). */
-	gSCManagerSceneData.scene_prev = sPortResetTarget;
+	gSCManagerSceneData.scene_prev = sPortResetPrev;
 	gSCManagerSceneData.scene_curr = sPortResetTarget;
 
 	syTaskmanSetLoadScene();
@@ -1927,7 +1943,7 @@ sb32 portSCManagerConsumeReset(void)
 	}
 	sPortResetPending = FALSE;
 
-	gSCManagerSceneData.scene_prev = sPortResetTarget;
+	gSCManagerSceneData.scene_prev = sPortResetPrev;
 	gSCManagerSceneData.scene_curr = sPortResetTarget;
 
 	return TRUE;

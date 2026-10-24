@@ -33,6 +33,7 @@
 #define SYNETSTATE_SLOTS_MAX 60
 
 extern void syNetStateInitDebugEnv(void);
+extern void syNetStateSetEnabled(sb32 enabled);
 extern void syNetStateStartVSSession(void);
 extern void syNetStateStopVSSession(void);
 

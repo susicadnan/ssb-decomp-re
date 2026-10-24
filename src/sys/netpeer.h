@@ -13,4 +13,13 @@ extern void syNetPeerUpdate(void);
 extern void syNetPeerPumpWhileStalled(void);
 extern void syNetPeerStopVSSession(void);
 
+#ifdef PORT
+#include <netsock.h>
+/* Lobby-driven session: see the comment block in netpeer.c. */
+extern void syNetPeerLobbyConfigure(intptr_t sock, const PortNetAddr *peer, sb32 is_host, u32 delay, u32 session_id,
+                                    u32 seed, u8 host_fighter, u8 client_fighter, u32 stage_kind);
+extern s32 syNetPeerLobbyStep(void);
+extern void syNetPeerLobbyAbort(void);
+#endif
+
 #endif /* _SYNETPEER_H_ */

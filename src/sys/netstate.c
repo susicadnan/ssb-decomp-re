@@ -253,6 +253,18 @@ void syNetStateInitDebugEnv(void)
 #endif
 }
 
+/* A lobby-made netplay session (sys/netpeer.c) needs rollback regardless of
+ * the debug environment. */
+void syNetStateSetEnabled(sb32 enabled)
+{
+	sSYNetStateIsEnabled = enabled;
+
+	if ((enabled != FALSE) && (sSYNetStateSlotCount < sSYNetStateSyncTestDepth + 2))
+	{
+		sSYNetStateSlotCount = sSYNetStateSyncTestDepth + 2;
+	}
+}
+
 void syNetStateStartVSSession(void)
 {
 	size_t total;

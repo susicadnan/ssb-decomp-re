@@ -5,6 +5,7 @@
 #include <sc/scmanager.h>
 #include <sys/netinput.h>
 #include <sys/netreplay.h>
+#include <sys/netstate.h>
 #include <sys/netsync.h>
 #include <sys/utils.h>
 
@@ -103,6 +104,14 @@ sb32 sSYNetPeerExecutionBeginLogged;
 intptr_t sSYNetPeerSocket = -1;
 PortNetAddr sSYNetPeerBindAddress;
 PortNetAddr sSYNetPeerPeerAddress;
+/* Lobby-driven session (syNetPeerLobbyConfigure / syNetPeerLobbyStep). */
+sb32 sSYNetPeerLobbyActive;
+s32 sSYNetPeerLobbyPhase;
+u32 sSYNetPeerLobbyFrames;
+u32 sSYNetPeerLobbyStartRepeat;
+sb32 sSYNetPeerLobbyHasPicks;
+u8 sSYNetPeerLobbyFighters[2];
+u32 sSYNetPeerLobbyStageKind;
 #endif
 
 u32 syNetPeerChecksumAccumulateU32(u32 checksum, u32 value)
@@ -378,6 +387,16 @@ void syNetPeerMakeBootstrapMetadata(SYNetInputReplayMetadata *metadata)
 	metadata->fighter_kinds[0] = nFTKindMario;
 	metadata->player_kinds[1] = nFTPlayerKindMan;
 	metadata->fighter_kinds[1] = nFTKindFox;
+
+#ifdef PORT
+	/* A lobby-driven session carries the players' picks. */
+	if (sSYNetPeerLobbyHasPicks != FALSE)
+	{
+		metadata->fighter_kinds[0] = sSYNetPeerLobbyFighters[0];
+		metadata->fighter_kinds[1] = sSYNetPeerLobbyFighters[1];
+		metadata->stage_kind = sSYNetPeerLobbyStageKind;
+	}
+#endif
 }
 
 void syNetPeerApplyBootstrapMetadata(const SYNetInputReplayMetadata *metadata)
@@ -638,20 +657,11 @@ void syNetPeerRunBootstrap(void)
 }
 #endif
 
-void syNetPeerInitDebugEnv(void)
-{
 #ifdef PORT
-	char *netplay_env = getenv("SSB64_NETPLAY");
-	char *local_player_env;
-	char *remote_player_env;
-	char *delay_env;
-	char *session_env;
-	char *bind_env;
-	char *peer_env;
-	char *bootstrap_env;
-	char *bootstrap_host_env;
-	char *bootstrap_seed_env;
-
+/* Everything a session needs reset to its "not configured" state, shared by
+ * the environment-driven debug path and the lobby path. */
+void syNetPeerResetConfig(void)
+{
 	sSYNetPeerIsEnabled = FALSE;
 	sSYNetPeerIsConfigured = FALSE;
 	sSYNetPeerLocalPlayer = 0;
@@ -674,6 +684,157 @@ void syNetPeerInitDebugEnv(void)
 	sSYNetPeerBattleStartRepeatFrames = 0;
 	sSYNetPeerExecutionHoldFrames = 0;
 	sSYNetPeerExecutionBeginLogged = FALSE;
+	sSYNetPeerLobbyActive = FALSE;
+	sSYNetPeerLobbyHasPicks = FALSE;
+}
+
+/* ---- Lobby-driven sessions (port/netplay/lobby.cpp) ----
+ * The lobby has already punched a hole to the peer on `sock`. It hands the
+ * socket and the match parameters over here, then calls syNetPeerLobbyStep()
+ * once per frame until it reports done, and only then moves the game into
+ * nSCKindVSBattle. This is the per-frame form of syNetPeerRunBootstrap's
+ * blocking loop; the packets are the same. Host = player 0, client = 1. */
+void syNetPeerLobbyConfigure(intptr_t sock, const PortNetAddr *peer, sb32 is_host, u32 delay, u32 session_id,
+                             u32 seed, u8 host_fighter, u8 client_fighter, u32 stage_kind)
+{
+	syNetPeerCloseSocket();
+	syNetPeerResetConfig();
+
+	sSYNetPeerIsEnabled = TRUE;
+	sSYNetPeerIsConfigured = TRUE;
+	sSYNetPeerLocalPlayer = (is_host != FALSE) ? 0 : 1;
+	sSYNetPeerRemotePlayer = (is_host != FALSE) ? 1 : 0;
+	sSYNetPeerInputDelay = delay;
+	sSYNetPeerSessionID = (session_id != 0) ? session_id : SYNETPEER_DEFAULT_SESSION_ID;
+	sSYNetPeerBootstrapIsEnabled = TRUE;
+	sSYNetPeerBootstrapIsHost = is_host;
+	sSYNetPeerBootstrapSeed = (seed != 0) ? seed : SYNETPEER_DEFAULT_BOOTSTRAP_SEED;
+	sSYNetPeerLobbyHasPicks = TRUE;
+	sSYNetPeerLobbyFighters[0] = host_fighter;
+	sSYNetPeerLobbyFighters[1] = client_fighter;
+	sSYNetPeerLobbyStageKind = stage_kind;
+	sSYNetPeerSocket = sock;
+	sSYNetPeerPeerAddress = *peer;
+	sSYNetPeerIsActive = TRUE;
+	sSYNetPeerLobbyActive = TRUE;
+	/* Predictions are only ever corrected by rollback. */
+	syNetStateSetEnabled(TRUE);
+	sSYNetPeerLobbyPhase = 0;
+	sSYNetPeerLobbyFrames = 0;
+	sSYNetPeerLobbyStartRepeat = 0;
+
+	if (is_host != FALSE)
+	{
+		syNetPeerMakeBootstrapMetadata(&sSYNetPeerBootstrapMetadata);
+		syNetPeerApplyBootstrapMetadata(&sSYNetPeerBootstrapMetadata);
+	}
+	port_log("SSB64 NetPeer: lobby session role=%s delay=%u session=%u seed=%u fighters=%u/%u stage=%u\n",
+	         (is_host != FALSE) ? "host" : "client", delay, sSYNetPeerSessionID, sSYNetPeerBootstrapSeed,
+	         host_fighter, client_fighter, stage_kind);
+}
+
+/* 1 = match config exchanged (enter the battle), 0 = still going, -1 = gave
+ * up (10 s without the peer's answer). */
+s32 syNetPeerLobbyStep(void)
+{
+	if (sSYNetPeerLobbyActive == FALSE)
+	{
+		return -1;
+	}
+	sSYNetPeerLobbyFrames++;
+
+	if (sSYNetPeerLobbyFrames > 600)
+	{
+		port_log("SSB64 NetPeer: lobby bootstrap timed out (phase %d)\n", sSYNetPeerLobbyPhase);
+		sSYNetPeerLobbyActive = FALSE;
+		return -1;
+	}
+	if (sSYNetPeerBootstrapIsHost != FALSE)
+	{
+		if (sSYNetPeerLobbyPhase == 0)
+		{
+			syNetPeerSendMatchConfigPacket();
+			syNetPeerReceiveBootstrapPackets();
+
+			if (sSYNetPeerBootstrapPeerReady != FALSE)
+			{
+				sSYNetPeerLobbyPhase = 1;
+				sSYNetPeerLobbyStartRepeat = 30;
+			}
+		}
+		else if (sSYNetPeerLobbyPhase == 1)
+		{
+			syNetPeerSendControlPacket(SYNETPEER_PACKET_START);
+			syNetPeerReceiveBootstrapPackets();
+
+			if (--sSYNetPeerLobbyStartRepeat == 0)
+			{
+				sSYNetPeerLobbyPhase = 2;
+			}
+		}
+	}
+	else
+	{
+		if (sSYNetPeerLobbyPhase == 0)
+		{
+			syNetPeerReceiveBootstrapPackets();
+
+			if (sSYNetPeerBootstrapMetadataApplied != FALSE)
+			{
+				syNetPeerSendControlPacket(SYNETPEER_PACKET_READY);
+				sSYNetPeerLobbyPhase = 1;
+			}
+		}
+		else if (sSYNetPeerLobbyPhase == 1)
+		{
+			syNetPeerSendControlPacket(SYNETPEER_PACKET_READY);
+			syNetPeerReceiveBootstrapPackets();
+
+			if (sSYNetPeerBootstrapStartReceived != FALSE)
+			{
+				sSYNetPeerLobbyPhase = 2;
+			}
+		}
+	}
+	if (sSYNetPeerLobbyPhase == 2)
+	{
+		extern void portSCManagerRequestResetTo(s32 scene, s32 scene_prev);
+
+		port_log("SSB64 NetPeer: lobby bootstrap complete role=%s stage=%u seed=%u\n",
+		         (sSYNetPeerBootstrapIsHost != FALSE) ? "host" : "client", sSYNetPeerBootstrapMetadata.stage_kind,
+		         sSYNetPeerBootstrapMetadata.rng_seed);
+		sSYNetPeerLobbyActive = FALSE;
+		/* Both players leave whatever menu they are in for the battle; the
+		 * battle state itself was written by syNetPeerApplyBootstrapMetadata. */
+		portSCManagerRequestResetTo(nSCKindVSBattle, nSCKindVSMode);
+		return 1;
+	}
+	return 0;
+}
+
+void syNetPeerLobbyAbort(void)
+{
+	sSYNetPeerLobbyActive = FALSE;
+	syNetPeerStopVSSession();
+	syNetPeerResetConfig();
+}
+#endif
+
+void syNetPeerInitDebugEnv(void)
+{
+#ifdef PORT
+	char *netplay_env = getenv("SSB64_NETPLAY");
+	char *local_player_env;
+	char *remote_player_env;
+	char *delay_env;
+	char *session_env;
+	char *bind_env;
+	char *peer_env;
+	char *bootstrap_env;
+	char *bootstrap_host_env;
+	char *bootstrap_seed_env;
+
+	syNetPeerResetConfig();
 
 	if ((netplay_env == NULL) || (atoi(netplay_env) == 0))
 	{
