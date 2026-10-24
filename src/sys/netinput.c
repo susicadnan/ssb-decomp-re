@@ -315,6 +315,20 @@ void syNetInputQueueLocalFrame(s32 player, u32 tick)
 	SYNetInputFrame frame;
 	u32 target = tick + sSYNetInputLocalDelay;
 
+	/* The first `delay` ticks of a match have no polled input behind them.
+	 * Queue neutral frames for them so the peer receives a frame for every
+	 * tick from 0 and its confirmed prefix can start growing; otherwise both
+	 * sides sit at "remote lag 9" forever. */
+	if (sSYNetInputLocalQueuedCount[player] == 0)
+	{
+		u32 t;
+
+		for (t = tick; t < target; t++)
+		{
+			syNetInputMakeFrame(&frame, t, 0, 0, 0, nSYNetInputSourceLocal, FALSE);
+			syNetInputStoreFrame(sSYNetInputLocalQueue, player, &frame);
+		}
+	}
 	syNetInputMakeLocalFrame(player, target, &frame);
 	syNetInputStoreFrame(sSYNetInputLocalQueue, player, &frame);
 

@@ -397,6 +397,16 @@ u32 syNetStateGetRollbackSlots(void)
 	return sSYNetStateSlotCount;
 }
 
+/* HUD (port/netplay/overlay.cpp). */
+void syNetStateGetStats(u32 *rollbacks, u32 *resim_ticks, u32 *max_depth, u32 *stalls, u32 *timesync_skips)
+{
+	*rollbacks = sSYNetStateRollbackCount;
+	*resim_ticks = sSYNetStateResimTickCount;
+	*max_depth = sSYNetStateMaxRollbackDepth;
+	*stalls = sSYNetStateStallCount;
+	*timesync_skips = sSYNetStateTimeSyncSkips;
+}
+
 void syNetStateGetDiag(u32 *phase, u32 *tick, u32 *resim_tick, u32 *rollbacks, u32 *synctest_runs)
 {
 	*phase = sSYNetStateDiagPhase;

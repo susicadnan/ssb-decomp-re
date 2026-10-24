@@ -13,6 +13,9 @@ extern void syNetPeerUpdate(void);
 extern void syNetPeerPumpWhileStalled(void);
 extern s32 syNetPeerGetLocalAdvantage(void);
 extern s32 syNetPeerGetAdvantageDelta(void);
+extern sb32 syNetPeerCheckActive(void);
+extern u32 syNetPeerGetPingMs(void);
+extern u32 syNetPeerGetInputDelay(void);
 extern void syNetPeerStopVSSession(void);
 
 #ifdef PORT

@@ -39,6 +39,7 @@ extern void syNetStateStopVSSession(void);
 
 extern sb32 syNetStateCheckActive(void);
 extern sb32 syNetStateCheckResimulating(void);
+extern void syNetStateGetStats(u32 *rollbacks, u32 *resim_ticks, u32 *max_depth, u32 *stalls, u32 *timesync_skips);
 extern u32 syNetStateGetOldestTick(void);
 extern u32 syNetStateGetRollbackSlots(void);
 

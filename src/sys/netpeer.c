@@ -47,6 +47,11 @@ extern void port_log(const char *fmt, ...);
 #define SYNETPEER_PACKET_START 3
 #define SYNETPEER_PACKET_BATTLE_READY 4
 #define SYNETPEER_PACKET_BATTLE_START 5
+#define SYNETPEER_PACKET_PING 6
+#define SYNETPEER_PACKET_PONG 7
+/* PING/PONG: control header + a u32 millisecond stamp the peer echoes back. */
+#define SYNETPEER_PING_PACKET_BYTES (4 + 2 + 2 + 4 + 4 + 4)
+#define SYNETPEER_PING_INTERVAL_FRAMES 30
 
 typedef struct SYNetPeerPacketFrame
 {
@@ -89,6 +94,9 @@ sb32 sSYNetPeerLastPacketTicksValid;
  * two run in step instead of one of them predicting deep and stalling. */
 s32 sSYNetPeerRemoteAdvantage;
 sb32 sSYNetPeerRemoteAdvantageValid;
+/* Round trip, smoothed; 0 until the first PONG. */
+u32 sSYNetPeerPingMs;
+u32 sSYNetPeerPingFrames;
 sb32 sSYNetPeerBootstrapIsEnabled;
 sb32 sSYNetPeerBootstrapIsHost;
 sb32 sSYNetPeerBootstrapMetadataApplied;
@@ -449,6 +457,62 @@ void syNetPeerSendControlPacket(u16 packet_type)
 }
 
 #ifdef PORT
+void syNetPeerSendPingPacket(u16 packet_type, u32 stamp_ms)
+{
+	u8 buffer[SYNETPEER_PING_PACKET_BYTES];
+	u8 *cursor = buffer;
+	u32 checksum;
+
+	syNetPeerWriteU32(&cursor, SYNETPEER_MAGIC);
+	syNetPeerWriteU16(&cursor, SYNETPEER_VERSION);
+	syNetPeerWriteU16(&cursor, packet_type);
+	syNetPeerWriteU32(&cursor, sSYNetPeerSessionID);
+	syNetPeerWriteU32(&cursor, stamp_ms);
+	checksum = syNetPeerChecksumBytes(buffer, cursor - buffer);
+	syNetPeerWriteU32(&cursor, checksum);
+	syNetPeerSendBytes(buffer, SYNETPEER_PING_PACKET_BYTES);
+}
+
+void syNetPeerHandlePingPacket(const u8 *buffer, s32 size)
+{
+	const u8 *cursor = buffer;
+	u32 magic;
+	u16 version;
+	u16 packet_type;
+	u32 session_id;
+	u32 stamp_ms;
+	u32 checksum;
+
+	if (size != SYNETPEER_PING_PACKET_BYTES)
+	{
+		return;
+	}
+	magic = syNetPeerReadU32(&cursor);
+	version = syNetPeerReadU16(&cursor);
+	packet_type = syNetPeerReadU16(&cursor);
+	session_id = syNetPeerReadU32(&cursor);
+	stamp_ms = syNetPeerReadU32(&cursor);
+	checksum = syNetPeerReadU32(&cursor);
+
+	if ((magic != SYNETPEER_MAGIC) || (version != SYNETPEER_VERSION) || (session_id != sSYNetPeerSessionID) ||
+	    (checksum != syNetPeerChecksumBytes(buffer, SYNETPEER_PING_PACKET_BYTES - 4)))
+	{
+		sSYNetPeerPacketsDropped++;
+		return;
+	}
+	if (packet_type == SYNETPEER_PACKET_PING)
+	{
+		syNetPeerSendPingPacket(SYNETPEER_PACKET_PONG, stamp_ms);
+	}
+	else if (packet_type == SYNETPEER_PACKET_PONG)
+	{
+		u32 rtt = port_netsock_now_ms() - stamp_ms;
+
+		/* Smooth a little; a single late packet should not bounce the HUD. */
+		sSYNetPeerPingMs = (sSYNetPeerPingMs == 0) ? rtt : (sSYNetPeerPingMs * 3 + rtt) / 4;
+	}
+}
+
 void syNetPeerSendMatchConfigPacket(void)
 {
 	u8 buffer[SYNETPEER_BOOTSTRAP_PACKET_BYTES];
@@ -954,6 +1018,8 @@ void syNetPeerStartVSSession(void)
 	sSYNetPeerLastPacketTicksValid = FALSE;
 	sSYNetPeerRemoteAdvantage = 0;
 	sSYNetPeerRemoteAdvantageValid = FALSE;
+	sSYNetPeerPingMs = 0;
+	sSYNetPeerPingFrames = 0;
 	sSYNetPeerIsActive = TRUE;
 	sSYNetPeerBattleBarrierEnabled = sSYNetPeerBootstrapIsEnabled;
 	sSYNetPeerBattleLocalReady = sSYNetPeerBattleBarrierEnabled;
@@ -1110,6 +1176,11 @@ void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 	if (size == SYNETPEER_CONTROL_PACKET_BYTES)
 	{
 		syNetPeerHandleControlPacket(buffer, size);
+		return;
+	}
+	if (size == SYNETPEER_PING_PACKET_BYTES)
+	{
+		syNetPeerHandlePingPacket(buffer, size);
 		return;
 	}
 #endif
@@ -1455,7 +1526,30 @@ void syNetPeerUpdate(void)
 		sSYNetPeerBattleStartRepeatFrames--;
 	}
 	syNetPeerSendLocalInput();
+#ifdef PORT
+	if (++sSYNetPeerPingFrames >= SYNETPEER_PING_INTERVAL_FRAMES)
+	{
+		sSYNetPeerPingFrames = 0;
+		syNetPeerSendPingPacket(SYNETPEER_PACKET_PING, port_netsock_now_ms());
+	}
+#endif
 	syNetPeerLogStats();
+}
+
+/* ---- HUD accessors (port/netplay/overlay.cpp) ---- */
+sb32 syNetPeerCheckActive(void)
+{
+	return sSYNetPeerIsActive;
+}
+
+u32 syNetPeerGetPingMs(void)
+{
+	return sSYNetPeerPingMs;
+}
+
+u32 syNetPeerGetInputDelay(void)
+{
+	return sSYNetPeerInputDelay;
 }
 
 /* Ticks our simulation has run past the newest input we hold from the peer.
