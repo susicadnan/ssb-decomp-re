@@ -114,6 +114,8 @@ extern sb32 syNetInputGetRemoteFrame(s32 player, u32 tick, SYNetInputFrame *out_
 extern void syNetInputQueueLocalFrame(s32 player, u32 tick);
 extern void syNetInputPublishFrame(s32 player, SYNetInputFrame *frame);
 extern void syNetInputPublishMainController(void);
+extern u16 syNetInputGetLocalFlags(s32 port);
+extern sb32 syNetInputCheckTapJumpOff(s32 player);
 extern void syNetInputMakeFrame(SYNetInputFrame *frame, u32 tick, u16 buttons, s8 stick_x, s8 stick_y,
                                 SYNetInputSource source, sb32 is_predicted);
 extern void syNetInputSetResimulating(sb32 is_resimulating);

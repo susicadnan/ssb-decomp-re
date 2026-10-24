@@ -3,6 +3,11 @@
 #include <sys/netpeer.h>
 #include <sys/netstate.h>
 #include <sys/taskman.h>
+#include <sc/scmanager.h>
+#include <sc/sctypes.h>
+#ifdef PORT
+#include <enhancements/enhancements.h>
+#endif
 
 typedef struct SYNetInputSlot
 {
@@ -63,6 +68,14 @@ sb32 sSYNetInputFakeLocal;
  * them hold their only controller in port 0; -1 = the slot's own port
  * (offline: every slot is its own controller). */
 s32 sSYNetInputLocalHardwarePort = -1;
+/* The player's "disable tap jump" preference rides in a bit the N64 pad never
+ * sets, so it reaches every peer (and replays) with the input it applies to:
+ * the setting is local to whoever holds the controller, but the simulation of
+ * their fighter must be the same everywhere. syNetInputPublishFrame() strips
+ * the bit before the game sees the buttons and keeps it here, rewritten every
+ * tick (re-simulated ones included). */
+#define SYNETINPUT_FLAG_TAP_JUMP_OFF 0x0080
+sb32 sSYNetInputTapJumpOff[MAXCONTROLLERS];
 
 #ifdef PORT
 extern char *getenv(const char *name);
@@ -274,6 +287,18 @@ void syNetInputSetSavedInput(s32 player, u32 tick, u16 buttons, s8 stick_x, s8 s
 	}
 }
 
+/* Preference bits the local player's frames carry (see sSYNetInputTapJumpOff). */
+u16 syNetInputGetLocalFlags(s32 port)
+{
+#ifdef PORT
+	if (port_enhancement_tap_jump_disabled(port) != FALSE)
+	{
+		return SYNETINPUT_FLAG_TAP_JUMP_OFF;
+	}
+#endif
+	return 0;
+}
+
 void syNetInputMakeLocalFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
 {
 	s32 port = (sSYNetInputLocalHardwarePort >= 0) ? sSYNetInputLocalHardwarePort : player;
@@ -313,6 +338,12 @@ void syNetInputMakeLocalFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
 		case 14: stick_y = -70; break;                   /* crouch / platform drop */
 		default: break;
 		}
+		/* Odd slots play with tap jump off, so the flag's trip through the
+		 * peer is covered as well. */
+		if (player & 1)
+		{
+			buttons |= SYNETINPUT_FLAG_TAP_JUMP_OFF;
+		}
 		syNetInputMakeFrame(out_frame, tick, buttons, stick_x, stick_y, nSYNetInputSourceLocal, FALSE);
 		return;
 	}
@@ -320,7 +351,7 @@ void syNetInputMakeLocalFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
 	(
 		out_frame,
 		tick,
-		controller->button_hold,
+		controller->button_hold | syNetInputGetLocalFlags(port),
 		controller->stick_range.x,
 		controller->stick_range.y,
 		nSYNetInputSourceLocal,
@@ -429,11 +460,14 @@ void syNetInputResolveFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
 void syNetInputPublishFrame(s32 player, SYNetInputFrame *frame)
 {
 	SYNetInputFrame *last_published = &sSYNetInputSlots[player].last_published;
-	u16 prev_buttons = (last_published->is_valid != FALSE) ? last_published->buttons : 0;
-	u16 pressed = (frame->buttons ^ prev_buttons) & frame->buttons;
-	u16 released = (frame->buttons ^ prev_buttons) & prev_buttons;
+	u16 buttons = frame->buttons & ~SYNETINPUT_FLAG_TAP_JUMP_OFF;
+	u16 prev_buttons = (last_published->is_valid != FALSE) ? last_published->buttons & ~SYNETINPUT_FLAG_TAP_JUMP_OFF : 0;
+	u16 pressed = (buttons ^ prev_buttons) & buttons;
+	u16 released = (buttons ^ prev_buttons) & prev_buttons;
 
-	gSYControllerDevices[player].button_hold = frame->buttons;
+	sSYNetInputTapJumpOff[player] = (frame->buttons & SYNETINPUT_FLAG_TAP_JUMP_OFF) ? TRUE : FALSE;
+
+	gSYControllerDevices[player].button_hold = buttons;
 	gSYControllerDevices[player].button_tap = pressed;
 	gSYControllerDevices[player].button_release = released;
 	gSYControllerDevices[player].button_update = pressed;
@@ -442,6 +476,27 @@ void syNetInputPublishFrame(s32 player, SYNetInputFrame *frame)
 
 	sSYNetInputSlots[player].last_published = *frame;
 	syNetInputStoreFrame(sSYNetInputHistory, player, frame);
+}
+
+/* Whether `player` has tap jump off. A VS battle always reads its controllers
+ * through syNetInputFuncRead(), online or not, so there the flag published with
+ * this tick's input decides; elsewhere (1P modes, training) it is the local
+ * setting for that port. */
+sb32 syNetInputCheckTapJumpOff(s32 player)
+{
+	if (syNetInputCheckPlayer(player) == FALSE)
+	{
+		return FALSE;
+	}
+	if (gSCManagerSceneData.scene_curr == nSCKindVSBattle)
+	{
+		return sSYNetInputTapJumpOff[player];
+	}
+#ifdef PORT
+	return (port_enhancement_tap_jump_disabled(player) != FALSE) ? TRUE : FALSE;
+#else
+	return FALSE;
+#endif
 }
 
 void syNetInputPublishMainController(void)

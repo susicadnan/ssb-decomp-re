@@ -235,6 +235,14 @@ void syControllerUpdateGlobalData(void)
                     &gSYControllerDevices[i].stick_range.y,
                     sSYControllerDescs[i].unk04);
 
+                // Before dpad_jump: it consumes the D-pad bits when on.
+                port_enhancement_dpad_smash(i,
+                    &gSYControllerDevices[i].button_hold,
+                    &gSYControllerDevices[i].button_tap,
+                    &gSYControllerDevices[i].stick_range.x,
+                    &gSYControllerDevices[i].stick_range.y,
+                    sSYControllerDescs[i].unk04);
+
                 port_enhancement_dpad_jump(i,
                     &gSYControllerDevices[i].button_hold,
                     &gSYControllerDevices[i].button_tap,

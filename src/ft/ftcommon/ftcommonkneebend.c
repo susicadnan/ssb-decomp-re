@@ -2,6 +2,7 @@
 
 #ifdef PORT
 #include <enhancements/enhancements.h>
+#include <sys/netinput.h>
 #endif
 
 // // // // // // // // // // // //
@@ -91,7 +92,9 @@ sb32 ftCommonKneeBendCheckButtonTap(FTStruct *fp)
 s32 ftCommonKneeBendGetInputTypeCommon(FTStruct *fp)
 {
 #ifdef PORT
-    sb32 tap_jump_disabled = port_enhancement_tap_jump_disabled(fp->player);
+    // Only for people: CPUs jump by pushing the stick up. Read through
+    // netinput so every peer applies the same player's own setting.
+    sb32 tap_jump_disabled = (fp->pkind == nFTPlayerKindMan) && syNetInputCheckTapJumpOff(fp->player);
 #else
     sb32 tap_jump_disabled = FALSE;
 #endif
@@ -132,7 +135,9 @@ sb32 ftCommonKneeBendCheckInterruptCommon(GObj *fighter_gobj)
 s32 ftCommonKneeBendGetInputTypeRun(FTStruct *fp)
 {
 #ifdef PORT
-    sb32 tap_jump_disabled = port_enhancement_tap_jump_disabled(fp->player);
+    // Only for people: CPUs jump by pushing the stick up. Read through
+    // netinput so every peer applies the same player's own setting.
+    sb32 tap_jump_disabled = (fp->pkind == nFTPlayerKindMan) && syNetInputCheckTapJumpOff(fp->player);
 #else
     sb32 tap_jump_disabled = FALSE;
 #endif
