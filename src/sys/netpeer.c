@@ -75,6 +75,13 @@ extern void port_log(const char *fmt, ...);
 #define SYNETPEER_PACKET_ROUND_CONFIG 9
 #define SYNETPEER_PACKET_ROUND_START 10 /* control-sized */
 #define SYNETPEER_PACKET_BYE 11         /* control-sized, any session */
+/* Ping-sized; the stamp carries (slot << 24) | first tick wanted. Sent while
+ * waiting on a port's input: every input packet repeats only the newest
+ * SYNETPEER_MAX_PACKET_FRAMES frames, so after a burst of loss longer than
+ * that (a Wi-Fi hiccup) the frames in the hole would never come again and
+ * both sides would wait on each other for good. */
+#define SYNETPEER_PACKET_RESEND 12
+#define SYNETPEER_RESEND_INTERVAL_MS 100
 #define SYNETPEER_ROSTER_ENTRY_BYTES (1 + 1 + 1 + 1 + SYNETPEER_CODE_BYTES)
 #define SYNETPEER_ROUND_PACKET_BYTES                                                                                  \
 	(4 + 2 + 2 + 4 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 4 + (SYNETPEER_MAX_MEMBERS * SYNETPEER_ROSTER_ENTRY_BYTES) +        \
@@ -121,6 +128,8 @@ u32 sSYNetPeerSeqGaps;
 u32 sSYNetPeerSeqDuplicates;
 u32 sSYNetPeerSeqOutOfOrder;
 u32 sSYNetPeerLastPeerAckTick;
+u32 sSYNetPeerResendsAsked;
+u32 sSYNetPeerResendsAnswered;
 u32 sSYNetPeerLastPacketOldestTick;
 u32 sSYNetPeerLastPacketNewestTick;
 sb32 sSYNetPeerLastPacketTicksValid;
@@ -857,6 +866,8 @@ void syNetPeerSendPingPacket(u16 packet_type, u32 stamp_ms)
 	syNetPeerSendPingPacketTo(packet_type, stamp_ms, -1);
 }
 
+void syNetPeerSendResendReply(s32 member, s32 slot, u32 first_tick);
+
 void syNetPeerHandlePingPacket(const u8 *buffer, s32 size, s32 member)
 {
 	const u8 *cursor = buffer;
@@ -906,6 +917,10 @@ void syNetPeerHandlePingPacket(const u8 *buffer, s32 size, s32 member)
 	{
 		sSYNetPeerRematchPeer = TRUE;
 		sSYNetPeerRematchPeerFighter = (u8)stamp_ms;
+	}
+	else if (packet_type == SYNETPEER_PACKET_RESEND)
+	{
+		syNetPeerSendResendReply(member, (s32)(stamp_ms >> 24), stamp_ms & 0x00FFFFFF);
 	}
 }
 
@@ -1062,6 +1077,15 @@ void syNetPeerHandleMatchConfigPacket(const u8 *buffer, s32 size)
 	if (sSYNetPeerBootstrapIsHost == FALSE)
 	{
 #ifdef PORT
+		/* The host repeats MATCH_CONFIG until it hears READY, so on a slow
+		 * or lossy line copies keep arriving after START, when the battle
+		 * scene has already built its fighters from this state. Applying
+		 * one then resets the live battle state (fighter_gobj and all)
+		 * under the running match: the shadows read a NULL fighter. */
+		if (sSYNetPeerBootstrapStartReceived != FALSE)
+		{
+			return;
+		}
 		if (sSYNetPeerMenuMode != FALSE)
 		{
 			if (sSYNetPeerMasksOverridden == FALSE)
@@ -2921,21 +2945,60 @@ sb32 syNetPeerCheckStartBarrierReleased(void)
 	return syNetPeerCheckBattleExecutionReady();
 }
 
+/* One input packet for a player slot: header, frames (zero-padded to the
+ * fixed size), checksum. */
+void syNetPeerWriteInputPacket(u8 *buffer, s32 slot, s32 advantage, const SYNetPeerPacketFrame *frames, s32 frame_count)
+{
+	SYNetPeerPacketFrame zero_frame;
+	u8 *cursor = buffer;
+	u32 checksum;
+	s32 i;
+
+	memset(&zero_frame, 0, sizeof(zero_frame));
+
+	checksum = syNetPeerChecksumPacket
+	(
+		sSYNetPeerSessionID,
+		sSYNetPeerHighestRemoteTick,
+		sSYNetPeerSendSeq,
+		(u8)slot,
+		(u8)frame_count,
+		frames
+	);
+
+	syNetPeerWriteU32(&cursor, SYNETPEER_MAGIC);
+	syNetPeerWriteU16(&cursor, SYNETPEER_VERSION);
+	syNetPeerWriteU16(&cursor, (u16)(s16)advantage);
+	syNetPeerWriteU32(&cursor, sSYNetPeerSessionID);
+	syNetPeerWriteU32(&cursor, sSYNetPeerHighestRemoteTick);
+	syNetPeerWriteU32(&cursor, sSYNetPeerSendSeq);
+	syNetPeerWriteU8(&cursor, (u8)slot);
+	syNetPeerWriteU8(&cursor, (u8)frame_count);
+	syNetPeerWriteU8(&cursor, (u8)slot);
+	syNetPeerWriteU8(&cursor, SYNETPEER_SLOT_NONE); /* was "remote player"; a group has several */
+
+	for (i = 0; i < SYNETPEER_MAX_PACKET_FRAMES; i++)
+	{
+		const SYNetPeerPacketFrame *frame = (i < frame_count) ? &frames[i] : &zero_frame;
+
+		syNetPeerWriteU32(&cursor, frame->tick);
+		syNetPeerWriteU16(&cursor, frame->buttons);
+		syNetPeerWriteU8(&cursor, (u8)frame->stick_x);
+		syNetPeerWriteU8(&cursor, (u8)frame->stick_y);
+	}
+	syNetPeerWriteU32(&cursor, checksum);
+}
+
 void syNetPeerBuildPacket(u8 *buffer, u32 *out_size)
 {
 	SYNetInputFrame queued_frame;
 	SYNetPeerPacketFrame frames[SYNETPEER_MAX_PACKET_FRAMES];
-	SYNetPeerPacketFrame zero_frame;
-	u8 *cursor = buffer;
 	u32 queued_count;
 	u32 latest_tick;
-	u32 checksum;
 	s32 frame_count = 0;
 	s32 back;
-	s32 i;
 
 	memset(frames, 0, sizeof(frames));
-	memset(&zero_frame, 0, sizeof(zero_frame));
 
 	/* Send from the local input queue: each frame is tagged with the tick it
 	 * will be applied on (poll tick + input delay), which is the tick the
@@ -2962,39 +3025,93 @@ void syNetPeerBuildPacket(u8 *buffer, u32 *out_size)
 			frame_count++;
 		}
 	}
-	checksum = syNetPeerChecksumPacket
-	(
-		sSYNetPeerSessionID,
-		sSYNetPeerHighestRemoteTick,
-		sSYNetPeerSendSeq,
-		(u8)sSYNetPeerLocalPlayer,
-		(u8)frame_count,
-		frames
-	);
+	syNetPeerWriteInputPacket(buffer, sSYNetPeerLocalPlayer, syNetPeerGetLocalAdvantage(), frames, frame_count);
+	*out_size = SYNETPEER_PACKET_BYTES;
+}
 
-	syNetPeerWriteU32(&cursor, SYNETPEER_MAGIC);
-	syNetPeerWriteU16(&cursor, SYNETPEER_VERSION);
-	syNetPeerWriteU16(&cursor, (u16)(s16)syNetPeerGetLocalAdvantage());
-	syNetPeerWriteU32(&cursor, sSYNetPeerSessionID);
-	syNetPeerWriteU32(&cursor, sSYNetPeerHighestRemoteTick);
-	syNetPeerWriteU32(&cursor, sSYNetPeerSendSeq);
-	syNetPeerWriteU8(&cursor, (u8)sSYNetPeerLocalPlayer);
-	syNetPeerWriteU8(&cursor, (u8)frame_count);
-	syNetPeerWriteU8(&cursor, (u8)sSYNetPeerLocalPlayer);
-	syNetPeerWriteU8(&cursor, SYNETPEER_SLOT_NONE); /* was "remote player"; a group has several */
+#ifdef PORT
+/* Answer a RESEND: the frames of slot from first_tick on, from our own queue
+ * (our port) or, as the host, from what we received for it (anyone's). */
+void syNetPeerSendResendReply(s32 member, s32 slot, u32 first_tick)
+{
+	u8 buffer[SYNETPEER_PACKET_BYTES];
+	SYNetPeerPacketFrame frames[SYNETPEER_MAX_PACKET_FRAMES];
+	SYNetInputFrame frame;
+	s32 frame_count = 0;
+	s32 i;
+
+	if ((slot < 0) || (slot >= MAXCONTROLLERS))
+	{
+		return;
+	}
+	if ((slot != sSYNetPeerLocalPlayer) && ((sSYNetPeerIsHub == FALSE) || !(sSYNetPeerRemoteMask & (1 << slot))))
+	{
+		return;
+	}
+	memset(frames, 0, sizeof(frames));
 
 	for (i = 0; i < SYNETPEER_MAX_PACKET_FRAMES; i++)
 	{
-		SYNetPeerPacketFrame *frame = (i < frame_count) ? &frames[i] : &zero_frame;
+		sb32 found = (slot == sSYNetPeerLocalPlayer)
+		             ? syNetInputGetLocalQueuedFrame(slot, first_tick + i, &frame)
+		             : syNetInputGetRemoteFrame(slot, first_tick + i, &frame);
 
-		syNetPeerWriteU32(&cursor, frame->tick);
-		syNetPeerWriteU16(&cursor, frame->buttons);
-		syNetPeerWriteU8(&cursor, (u8)frame->stick_x);
-		syNetPeerWriteU8(&cursor, (u8)frame->stick_y);
+		if (found == FALSE)
+		{
+			break;
+		}
+		frames[frame_count].tick = frame.tick;
+		frames[frame_count].buttons = frame.buttons;
+		frames[frame_count].stick_x = frame.stick_x;
+		frames[frame_count].stick_y = frame.stick_y;
+		frame_count++;
 	}
-	syNetPeerWriteU32(&cursor, checksum);
-	*out_size = SYNETPEER_PACKET_BYTES;
+	if (frame_count == 0)
+	{
+		return;
+	}
+	syNetPeerWriteInputPacket(buffer, slot,
+	                          (slot == sSYNetPeerLocalPlayer) ? syNetPeerGetLocalAdvantage() : sSYNetPeerSlotAdvantage[slot],
+	                          frames, frame_count);
+	syNetPeerSendToMember(member, buffer, SYNETPEER_PACKET_BYTES);
+	sSYNetPeerResendsAnswered++;
 }
+
+/* Waiting on someone's input: ask for it again from the first tick we lack.
+ * A guest asks the host (it has every port's frames), the host asks the
+ * member playing that port. */
+void syNetPeerRequestMissingInput(void)
+{
+	static u32 last_ms;
+	u32 now = port_netsock_now_ms();
+	s32 slot;
+
+	if ((now - last_ms) < SYNETPEER_RESEND_INTERVAL_MS)
+	{
+		return;
+	}
+	last_ms = now;
+
+	for (slot = 0; slot < MAXCONTROLLERS; slot++)
+	{
+		s32 to;
+
+		if (!(sSYNetPeerRemoteMask & (1 << slot)))
+		{
+			continue;
+		}
+		to = (sSYNetPeerIsHub != FALSE) ? sSYNetPeerSlotOwner[slot] : 0;
+
+		if ((to < 0) || (to >= SYNETPEER_MAX_MEMBERS) || (sSYNetPeerMembers[to].is_used == FALSE))
+		{
+			continue;
+		}
+		syNetPeerSendPingPacketTo(SYNETPEER_PACKET_RESEND,
+		                          ((u32)slot << 24) | (syNetInputGetRemoteConfirmedCount(slot) & 0x00FFFFFF), to);
+		sSYNetPeerResendsAsked++;
+	}
+}
+#endif
 
 void syNetPeerSendLocalInput(void)
 {
@@ -3564,6 +3681,7 @@ void syNetPeerPumpWhileStalled(void)
 	syNetPeerReceiveRemoteInput();
 	syNetPeerSendLocalInput();
 #ifdef PORT
+	syNetPeerRequestMissingInput();
 	/* A spectator sends no input: its pings are how the host knows it is
 	 * still there. */
 	if (sSYNetPeerLocalPlayer < 0)
@@ -3578,9 +3696,10 @@ void syNetPeerStopVSSession(void)
 #ifdef PORT
 	if (sSYNetPeerIsActive != FALSE)
 	{
-		port_log("SSB64 NetPeer: VS session stop sent=%u recv=%u dropped=%u staged=%u late=%u checksum=0x%08X\n",
+		port_log("SSB64 NetPeer: VS session stop sent=%u recv=%u dropped=%u staged=%u late=%u resends=%u/%u checksum=0x%08X\n",
 		         sSYNetPeerPacketsSent, sSYNetPeerPacketsReceived, sSYNetPeerPacketsDropped,
-		         sSYNetPeerFramesStaged, sSYNetPeerLateFrames, sSYNetPeerInputChecksum);
+		         sSYNetPeerFramesStaged, sSYNetPeerLateFrames, sSYNetPeerResendsAsked, sSYNetPeerResendsAnswered,
+		         sSYNetPeerInputChecksum);
 	}
 	if (sSYNetPeerMenuMode != FALSE)
 	{
