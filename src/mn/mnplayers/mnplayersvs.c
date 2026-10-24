@@ -4719,6 +4719,32 @@ void mnPlayersVSUpdateControllerOrders(void)
 			}
 		}
 	}
+#ifdef PORT
+	/* Netplay diagnostics: both machines log the same slots at the same
+	 * tics, so the logs can be compared to find the first divergence. */
+	{
+		extern sb32 syNetMenuCheckActive(void);
+		extern void port_log(const char *fmt, ...);
+
+		if ((syNetMenuCheckActive() != FALSE) && ((sMNPlayersVSTotalTimeTics % 300) == 0))
+		{
+			s32 p;
+
+			for (p = 0; p < 2; p++)
+			{
+				MNPlayersSlotVS *slot = &sMNPlayersVSSlots[p];
+				SObj *cursor = (slot->cursor != NULL) ? SObjGetStruct(slot->cursor) : NULL;
+				SObj *puck = (slot->puck != NULL) ? SObjGetStruct(slot->puck) : NULL;
+
+				port_log("SSB64 CSS tic=%d p%d cur=(%.2f,%.2f) puck=(%.2f,%.2f) st=%d fk=%d held=%d in=%04X/%d,%d\n",
+				         sMNPlayersVSTotalTimeTics, p, cursor ? cursor->pos.x : -1.0F, cursor ? cursor->pos.y : -1.0F,
+				         puck ? puck->pos.x : -1.0F, puck ? puck->pos.y : -1.0F, slot->cursor_status, slot->fkind,
+				         slot->held_player, gSYControllerDevices[p].button_hold, gSYControllerDevices[p].stick_range.x,
+				         gSYControllerDevices[p].stick_range.y);
+			}
+		}
+	}
+#endif
 }
 
 // 0x8013A30C
@@ -4867,6 +4893,16 @@ void mnPlayersVSSetSceneData(void)
 {
 	s32 i;
 
+#ifdef PORT
+	{
+		extern void port_log(const char *fmt, ...);
+
+		port_log("SSB64 CSS: scene data next=%d slots=%d/%d %d/%d %d/%d %d/%d\n", (int)gSCManagerSceneData.scene_curr,
+		         sMNPlayersVSSlots[0].pkind, sMNPlayersVSSlots[0].fkind, sMNPlayersVSSlots[1].pkind,
+		         sMNPlayersVSSlots[1].fkind, sMNPlayersVSSlots[2].pkind, sMNPlayersVSSlots[2].fkind,
+		         sMNPlayersVSSlots[3].pkind, sMNPlayersVSSlots[3].fkind);
+	}
+#endif
 	gSCManagerTransferBattleState.time_limit = sMNPlayersVSTimeValue;
 	gSCManagerTransferBattleState.stocks = sMNPlayersVSStockValue;
 	gSCManagerTransferBattleState.is_team_battle = sMNPlayersVSIsTeamBattle;
@@ -5308,6 +5344,14 @@ void mnPlayersVSResetPlayer(s32 player)
 	sMNPlayersVSSlots[player].handicap = gSCManagerTransferBattleState.players[player].handicap;
 	sMNPlayersVSSlots[player].fkind = nFTKindNull;
 	sMNPlayersVSSlots[player].is_recalling = FALSE;
+#ifdef PORT
+	/* These statics survive from the previous visit; the N64 only ever
+	 * reset players on a fresh boot, where they were still zero. A slot
+	 * with no fighter must not count as ready (mnPlayersVSCheckReady) or
+	 * START would carry nFTKindNull into the battle. */
+	sMNPlayersVSSlots[player].is_fighter_selected = FALSE;
+	sMNPlayersVSSlots[player].is_status_selected = FALSE;
+#endif
 	sMNPlayersVSSlots[player].team = default_teams[player];
 
 	if (sMNPlayersVSControllerOrders[player] == -1)
@@ -5488,6 +5532,20 @@ void mnPlayersVSFuncStart(void)
 	mnPlayersVSMakeWallpaper();
 	mnPlayersVSMakePortraitAll();
 	mnPlayersVSInitSlotAll();
+#ifdef PORT
+	{
+		extern void port_log(const char *fmt, ...);
+
+		port_log("SSB64 CSS: start prev=%d orders=%d,%d,%d,%d slots=%d/%d %d/%d %d/%d %d/%d transfer=%d/%d %d/%d\n",
+		         (int)gSCManagerSceneData.scene_prev, sMNPlayersVSControllerOrders[0], sMNPlayersVSControllerOrders[1],
+		         sMNPlayersVSControllerOrders[2], sMNPlayersVSControllerOrders[3], sMNPlayersVSSlots[0].pkind,
+		         sMNPlayersVSSlots[0].fkind, sMNPlayersVSSlots[1].pkind, sMNPlayersVSSlots[1].fkind,
+		         sMNPlayersVSSlots[2].pkind, sMNPlayersVSSlots[2].fkind, sMNPlayersVSSlots[3].pkind,
+		         sMNPlayersVSSlots[3].fkind, gSCManagerTransferBattleState.players[0].pkind,
+		         gSCManagerTransferBattleState.players[0].fkind, gSCManagerTransferBattleState.players[1].pkind,
+		         gSCManagerTransferBattleState.players[1].fkind);
+	}
+#endif
 	mnPlayersVSMakeLabels();
 	mnPlayersVSMakePuckAdjust();
 	mnPlayersVSMakePuckGlow();

@@ -222,18 +222,51 @@ s32 syUtilsRandIntRange(s32 range)
 #endif
 }
 
+#ifdef PORT
+/* The wall-clock "random" the menus use for random stage / fighter picks and
+ * title-screen variety. During a netplay session both machines must draw the
+ * same values (the stage select's random pick decides what both load), so
+ * they come from the seeded generator instead; sys/netpeer.c seeds it on
+ * both sides at every phase. */
+extern sb32 syNetPeerCheckActive(void);
+extern sb32 syNetMenuCheckActive(void);
+
+static sb32 syUtilsRandTimeIsShared(void)
+{
+    return ((syNetPeerCheckActive() != FALSE) || (syNetMenuCheckActive() != FALSE)) ? TRUE : FALSE;
+}
+#endif
+
 u8 syUtilsRandTimeUChar(void)
 {
+#ifdef PORT
+    if (syUtilsRandTimeIsShared() != FALSE)
+    {
+        return (u8)syUtilsRandIntRange(256);
+    }
+#endif
     return osGetTime();
 }
 
 f32 syUtilsRandTimeFloat(void)
 {
+#ifdef PORT
+    if (syUtilsRandTimeIsShared() != FALSE)
+    {
+        return syUtilsRandIntRange(256) / 256.0F;
+    }
+#endif
     return (osGetTime() & 0xFF) / 256.0F;
 }
 
 s32 syUtilsRandTimeUCharRange(s32 range)
 {
+#ifdef PORT
+    if (syUtilsRandTimeIsShared() != FALSE)
+    {
+        return (syUtilsRandIntRange(256) * range) / 256.0F;
+    }
+#endif
     return ((s32)(osGetTime() & 0xFF) * range) / 256.0F;
 }
 

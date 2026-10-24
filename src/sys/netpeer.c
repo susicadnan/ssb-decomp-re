@@ -345,14 +345,12 @@ sb32 syNetPeerCheckMetadata(const SYNetInputReplayMetadata *metadata)
 #ifdef PORT
 void syNetPeerSleepBootstrapRetry(void)
 {
-	/* An in-menu session exchanges the battle state from inside the scene
-	 * start, on the game coroutine: give the frame back to the port so the
-	 * window keeps drawing and pumping events while we wait. */
-	if (sSYNetPeerMenuMode != FALSE)
-	{
-		port_coroutine_yield();
-		return;
-	}
+	/* An in-menu session exchanges the battle state from inside the battle
+	 * scene's start function. Yielding the game coroutine there is not
+	 * safe (the previous scene's GObjs were still being ejected around the
+	 * yield and the second battle of a session crashed in
+	 * ftManagerSetupFilesAllKind), so the whole process sleeps instead; on a
+	 * normal connection the peer answers within a frame or two. */
 	port_netsock_sleep_us(SYNETPEER_BOOTSTRAP_RETRY_USECS);
 }
 
@@ -500,6 +498,11 @@ void syNetPeerApplyBootstrapMetadata(const SYNetInputReplayMetadata *metadata)
 		 * for the battle scene that may be starting right now. */
 		gSCManagerTransferBattleState.is_stage_select = metadata->is_stage_select;
 		gSCManagerSceneData.gkind = metadata->stage_kind;
+		/* The default state the replay path copies in asks the character
+		 * select to reset every slot. Right at the start of a session: yes,
+		 * on both sides. At a battle start: no, so the next character select
+		 * finds the tokens on the fighters just played, like the console. */
+		gSCManagerTransferBattleState.is_reset_players = (sSYNetPeerSessionPhase == 0) ? TRUE : FALSE;
 		sSYNetPeerBootstrapMetadataApplied = TRUE;
 		port_log("SSB64 NetPeer: battle state applied host=%d stage=%u seed=%u rules=%u stocks=%u time=%u p0=%u/%u p1=%u/%u\n",
 		         sSYNetPeerBootstrapIsHost, metadata->stage_kind, metadata->rng_seed, metadata->game_rules,
@@ -1063,7 +1066,8 @@ s32 syNetPeerLobbyStep(void)
 			 * sides, so a random pick in the character select agrees too. */
 			syNetPeerBeginPhase();
 			syUtilsSetRandomSeed(sSYNetPeerBootstrapSeed);
-			syNetMenuStart(sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer, sSYNetPeerInputDelay, nSCKindVSMode);
+			syNetMenuStart(sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer, sSYNetPeerInputDelay, nSCKindVSMode,
+			               sSYNetPeerBootstrapSeed);
 			portSCManagerRequestResetTo(nSCKindVSMode, nSCKindModeSelect);
 			return 1;
 		}
@@ -1912,7 +1916,8 @@ void syNetPeerStopVSSession(void)
 		/* Back to the menus (results, then the character select) in
 		 * lockstep; the connection stays up for the next game. */
 		syNetPeerBeginPhase();
-		syNetMenuStart(sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer, sSYNetPeerInputDelay, -1);
+		syNetMenuStart(sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer, sSYNetPeerInputDelay, -1,
+		               sSYNetPeerBootstrapSeed ^ (sSYNetPeerSessionPhase * 2654435761U));
 		return;
 	}
 	if ((sSYNetPeerLobbySession != FALSE) && (sSYNetPeerIsActive != FALSE) && (sSYNetPeerPostMatch == FALSE))

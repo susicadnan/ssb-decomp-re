@@ -569,6 +569,18 @@ void scVSBattleStartSuddenDeath(void)
 
 	gSCManagerSceneData.is_reset = FALSE;
 
+#ifdef PORT
+	/* Sudden death is a second battle inside the same netplay session. The
+	 * tick at which the first one ended is not the same on both machines
+	 * (the GAME SET sequence waits on audio), so the two cannot simply keep
+	 * counting: restart the input tick space, re-run the start handshake
+	 * (and, for an in-menu session, the exchange of the host's battle
+	 * state) and open a new snapshot ring on the fresh arena. taskman ended
+	 * the previous rollback session when it reset the arena. */
+	syNetInputStartVSSession();
+	syNetPeerStartVSSession();
+	syNetStateStartVSSession();
+#endif
 	scVSBattleSetupFiles();
 	gcMakeDefaultCameraGObj(nGCCommonLinkIDCamera, GOBJ_PRIORITY_DEFAULT, 100, COBJ_FLAG_ZBUFFER, GPACK_RGBA8888(0x00, 0x00, 0x00, 0xFF));
 	efParticleInitAll();

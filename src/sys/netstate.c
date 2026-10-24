@@ -375,9 +375,9 @@ void syNetStateStopVSSession(void)
 	port_netstate_host_end();
 
 	sSYNetStateLogCount = 0;
-	syNetStateLog("SSB64 NetState: session end saves=%u rollbacks=%u resim_ticks=%u max_depth=%u too_old=%u "
+	syNetStateLog("SSB64 NetState: session end tick=%u saves=%u rollbacks=%u resim_ticks=%u max_depth=%u too_old=%u "
 	              "stalls=%u timesync_skips=%u max_arena_used=%zu synctest_runs=%u synctest_mismatches=%u\n",
-	              sSYNetStateSaveCount, sSYNetStateRollbackCount, sSYNetStateResimTickCount,
+	              syNetInputGetTick(), sSYNetStateSaveCount, sSYNetStateRollbackCount, sSYNetStateResimTickCount,
 	              sSYNetStateMaxRollbackDepth, sSYNetStateRollbackTooOldCount, sSYNetStateStallCount,
 	              sSYNetStateTimeSyncSkips, sSYNetStateMaxArenaUsed, sSYNetStateSyncTestRuns,
 	              sSYNetStateSyncTestMismatches);
@@ -772,6 +772,8 @@ void syNetStateRunTick(void (*task_update)(void *), void *tfunc)
 		{
 			sSYNetStateRollbackCount++;
 			sSYNetStateDiagPhase = nSYNetStatePhaseRollbackResim;
+			syNetStateLog("SSB64 NetState: rollback %u -> %u (depth %u, #%u)\n", from, cur, cur - from,
+			              sSYNetStateRollbackCount);
 			syNetStateResimulate(from, cur, task_update, tfunc);
 		}
 	}

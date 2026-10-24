@@ -17,8 +17,10 @@
  * function while a session is active. */
 
 /* arm_scene: the lockstep ticks begin with the first controller read inside
- * that scene (the one both players are being sent to); -1 = right away. */
-extern void syNetMenuStart(s32 local_player, s32 remote_player, u32 delay, s32 arm_scene);
+ * that scene (the one both players are being sent to); -1 = right away. The
+ * game's RNG is re-seeded with `seed` on that first tick, so both sides draw
+ * the same numbers from then on whatever ran before. */
+extern void syNetMenuStart(s32 local_player, s32 remote_player, u32 delay, s32 arm_scene, u32 seed);
 extern void syNetMenuStop(void);
 extern sb32 syNetMenuCheckActive(void);
 /* TRUE: both players' inputs for this tick are in gSYControllerDevices, run

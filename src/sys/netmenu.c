@@ -7,12 +7,14 @@
 #include <sys/controller.h>
 #include <sys/netinput.h>
 #include <sys/netpeer.h>
+#include <sys/utils.h>
 
 #ifdef PORT
 extern void port_log(const char *fmt, ...);
 extern char *getenv(const char *name);
 extern int atoi(const char *s);
 extern sb32 sSYNetInputFakeLocal; /* sys/netinput.c */
+extern void port_coroutine_yield(void);
 #endif
 
 /* Frames of consecutive waiting before the peer counts as gone (10 s). */
@@ -21,6 +23,7 @@ extern sb32 sSYNetInputFakeLocal; /* sys/netinput.c */
 
 sb32 sSYNetMenuIsActive;
 s32 sSYNetMenuArmScene;  /* -1 once ticking */
+u32 sSYNetMenuSeed;
 s32 sSYNetMenuLocalPlayer;
 s32 sSYNetMenuRemotePlayer;
 u32 sSYNetMenuDelay;
@@ -37,8 +40,9 @@ static s32 syNetMenuHardwarePort(void)
 	return (gSYControllerDeviceStatuses[0] >= 0) ? gSYControllerDeviceStatuses[0] : 0;
 }
 
-void syNetMenuStart(s32 local_player, s32 remote_player, u32 delay, s32 arm_scene)
+void syNetMenuStart(s32 local_player, s32 remote_player, u32 delay, s32 arm_scene, u32 seed)
 {
+	sSYNetMenuSeed = seed;
 	syNetInputReset();
 	syNetInputSetSlotSource(local_player, nSYNetInputSourceLocal);
 	syNetInputSetSlotSource(remote_player, nSYNetInputSourceRemoteConfirmed);
@@ -179,6 +183,7 @@ static void syNetMenuBotOverride(u32 tick)
 sb32 syNetMenuFuncRead(void)
 {
 	SYNetInputFrame frame;
+	SYNetInputFrame remote_frame;
 	u32 tick = syNetInputGetTick();
 	s32 player;
 
@@ -203,6 +208,13 @@ sb32 syNetMenuFuncRead(void)
 		port_log("SSB64 NetMenu: ticking from scene %d\n", (int)gSCManagerSceneData.scene_curr);
 #endif
 	}
+	/* First shared tick: the two machines ran different things until here
+	 * (each was somewhere else when the connection came up), so align the
+	 * RNG now; the character select spreads the tokens with it. */
+	if (sSYNetMenuTicks == 0)
+	{
+		syUtilsSetRandomSeed((s32)sSYNetMenuSeed);
+	}
 #ifdef PORT
 	if (sSYNetMenuBot != FALSE)
 	{
@@ -213,14 +225,29 @@ sb32 syNetMenuFuncRead(void)
 	{
 		syNetInputQueueLocalFrame(sSYNetMenuLocalPlayer, tick);
 	}
-	/* Receive the peer's frames and (re)send ours. */
-	syNetPeerPumpWhileStalled();
-#ifdef PORT
-	syNetPeerSendPeriodicPing();
-#endif
+	/* Wait for the peer's frame for this tick without leaving the tick: a
+	 * yield hands the frame back to the port (it shows the previous image
+	 * again) and resumes here. Skipping the update and letting the scene
+	 * draw instead would run the menus' display callbacks an extra time on
+	 * the side that waits longer, and the character select moves its tokens
+	 * from one of those; the two machines then disagree. */
+	sSYNetMenuWaitRun = 0;
 
-	if (syNetInputGetRemoteFrame(sSYNetMenuRemotePlayer, tick, &frame) == FALSE)
+	for (;;)
 	{
+		/* Receive the peer's frames and (re)send ours. */
+		syNetPeerPumpWhileStalled();
+#ifdef PORT
+		syNetPeerSendPeriodicPing();
+#endif
+		if (sSYNetMenuIsActive == FALSE)
+		{
+			return TRUE; /* the session ended while we waited */
+		}
+		if (syNetInputGetRemoteFrame(sSYNetMenuRemotePlayer, tick, &frame) != FALSE)
+		{
+			break;
+		}
 		sSYNetMenuWaitRun++;
 		sSYNetMenuWaitTotal++;
 
@@ -231,16 +258,22 @@ sb32 syNetMenuFuncRead(void)
 			sSYNetMenuWaitRun = 0;
 			syNetPeerAbortMatch("connection lost");
 #endif
+			return FALSE;
 		}
+#ifdef PORT
+		port_coroutine_yield();
+#else
 		return FALSE;
+#endif
 	}
-	sSYNetMenuWaitRun = 0;
+
+	remote_frame = frame;
 
 	for (player = 0; player < MAXCONTROLLERS; player++)
 	{
 		if (player == sSYNetMenuRemotePlayer)
 		{
-			syNetInputPublishFrame(player, &frame);
+			syNetInputPublishFrame(player, &remote_frame);
 		}
 		else if ((player == sSYNetMenuLocalPlayer)
 		         && (syNetInputGetLocalQueuedFrame(player, tick, &frame) != FALSE))
