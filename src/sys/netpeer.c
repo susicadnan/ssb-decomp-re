@@ -23,7 +23,7 @@ extern void port_log(const char *fmt, ...);
 #endif
 
 #define SYNETPEER_MAGIC 0x53534E50 // SSNP
-#define SYNETPEER_VERSION 2
+#define SYNETPEER_VERSION 3 // 3: the spare header u16 carries the sender's frame advantage
 #define SYNETPEER_MAX_PACKET_FRAMES 16
 #define SYNETPEER_FRAME_BYTES 8
 #define SYNETPEER_INPUT_HEADER_BYTES (4 + 2 + 2 + 4 + 4 + 4 + 1 + 1 + 1 + 1)
@@ -82,6 +82,13 @@ u32 sSYNetPeerLastPeerAckTick;
 u32 sSYNetPeerLastPacketOldestTick;
 u32 sSYNetPeerLastPacketNewestTick;
 sb32 sSYNetPeerLastPacketTicksValid;
+/* Time sync (GGPO-style frame advantage). Local advantage = how many ticks
+ * our simulation is ahead of the newest input we have from the peer; each
+ * packet carries the sender's value so both sides can compare. The side
+ * that is further ahead skips the occasional tick (sys/netstate.c) so the
+ * two run in step instead of one of them predicting deep and stalling. */
+s32 sSYNetPeerRemoteAdvantage;
+sb32 sSYNetPeerRemoteAdvantageValid;
 sb32 sSYNetPeerBootstrapIsEnabled;
 sb32 sSYNetPeerBootstrapIsHost;
 sb32 sSYNetPeerBootstrapMetadataApplied;
@@ -945,6 +952,8 @@ void syNetPeerStartVSSession(void)
 	sSYNetPeerSeqOutOfOrder = 0;
 	sSYNetPeerLastPeerAckTick = 0;
 	sSYNetPeerLastPacketTicksValid = FALSE;
+	sSYNetPeerRemoteAdvantage = 0;
+	sSYNetPeerRemoteAdvantageValid = FALSE;
 	sSYNetPeerIsActive = TRUE;
 	sSYNetPeerBattleBarrierEnabled = sSYNetPeerBootstrapIsEnabled;
 	sSYNetPeerBattleLocalReady = sSYNetPeerBattleBarrierEnabled;
@@ -1036,7 +1045,7 @@ void syNetPeerBuildPacket(u8 *buffer, u32 *out_size)
 
 	syNetPeerWriteU32(&cursor, SYNETPEER_MAGIC);
 	syNetPeerWriteU16(&cursor, SYNETPEER_VERSION);
-	syNetPeerWriteU16(&cursor, 0);
+	syNetPeerWriteU16(&cursor, (u16)(s16)syNetPeerGetLocalAdvantage());
 	syNetPeerWriteU32(&cursor, sSYNetPeerSessionID);
 	syNetPeerWriteU32(&cursor, sSYNetPeerHighestRemoteTick);
 	syNetPeerWriteU32(&cursor, sSYNetPeerSendSeq);
@@ -1089,6 +1098,7 @@ void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 	u32 checksum;
 	u32 expected_checksum;
 	u16 version;
+	s32 remote_advantage;
 	u8 player;
 	u8 frame_count;
 	u8 packet_local_player;
@@ -1112,7 +1122,7 @@ void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 
 	magic = syNetPeerReadU32(&cursor);
 	version = syNetPeerReadU16(&cursor);
-	(void)syNetPeerReadU16(&cursor);
+	remote_advantage = (s16)syNetPeerReadU16(&cursor);
 	session_id = syNetPeerReadU32(&cursor);
 	ack_tick = syNetPeerReadU32(&cursor);
 	packet_seq = syNetPeerReadU32(&cursor);
@@ -1146,6 +1156,8 @@ void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 		return;
 	}
 	sSYNetPeerPacketsReceived++;
+	sSYNetPeerRemoteAdvantage = remote_advantage;
+	sSYNetPeerRemoteAdvantageValid = TRUE;
 
 	if (sSYNetPeerRecvSeqInitialized == FALSE)
 	{
@@ -1444,6 +1456,28 @@ void syNetPeerUpdate(void)
 	}
 	syNetPeerSendLocalInput();
 	syNetPeerLogStats();
+}
+
+/* Ticks our simulation has run past the newest input we hold from the peer.
+ * Positive = we are ahead (predicting), negative = behind. */
+s32 syNetPeerGetLocalAdvantage(void)
+{
+	if (sSYNetPeerIsActive == FALSE)
+	{
+		return 0;
+	}
+	return (s32)syNetInputGetTick() - (s32)sSYNetPeerHighestRemoteTick;
+}
+
+/* How much further ahead we are than the peer says it is; 0 until the
+ * first packet. Positive means we should give way. */
+s32 syNetPeerGetAdvantageDelta(void)
+{
+	if ((sSYNetPeerIsActive == FALSE) || (sSYNetPeerRemoteAdvantageValid == FALSE))
+	{
+		return 0;
+	}
+	return syNetPeerGetLocalAdvantage() - sSYNetPeerRemoteAdvantage;
 }
 
 /* Called by sys/netstate.c instead of the tick while it stalls for a peer

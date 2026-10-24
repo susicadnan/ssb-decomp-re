@@ -87,6 +87,8 @@ static u32 sSYNetStateRollbackTooOldCount;
 static u32 sSYNetStateSyncTestRuns;
 static u32 sSYNetStateSyncTestMismatches;
 static u32 sSYNetStateStallCount;
+static u32 sSYNetStateTimeSyncSkips;
+static u32 sSYNetStateTimeSyncCooldown;
 static u32 sSYNetStateLogCount;
 static size_t sSYNetStateMaxArenaUsed;
 
@@ -327,6 +329,8 @@ void syNetStateStartVSSession(void)
 	sSYNetStateSyncTestRuns = 0;
 	sSYNetStateSyncTestMismatches = 0;
 	sSYNetStateStallCount = 0;
+	sSYNetStateTimeSyncSkips = 0;
+	sSYNetStateTimeSyncCooldown = 0;
 	sSYNetStateLogCount = 0;
 	sSYNetStateMaxArenaUsed = 0;
 
@@ -353,10 +357,11 @@ void syNetStateStopVSSession(void)
 
 	sSYNetStateLogCount = 0;
 	syNetStateLog("SSB64 NetState: session end saves=%u rollbacks=%u resim_ticks=%u max_depth=%u too_old=%u "
-	              "stalls=%u max_arena_used=%zu synctest_runs=%u synctest_mismatches=%u\n",
+	              "stalls=%u timesync_skips=%u max_arena_used=%zu synctest_runs=%u synctest_mismatches=%u\n",
 	              sSYNetStateSaveCount, sSYNetStateRollbackCount, sSYNetStateResimTickCount,
 	              sSYNetStateMaxRollbackDepth, sSYNetStateRollbackTooOldCount, sSYNetStateStallCount,
-	              sSYNetStateMaxArenaUsed, sSYNetStateSyncTestRuns, sSYNetStateSyncTestMismatches);
+	              sSYNetStateTimeSyncSkips, sSYNetStateMaxArenaUsed, sSYNetStateSyncTestRuns,
+	              sSYNetStateSyncTestMismatches);
 
 	syNetStateFreeSlots();
 }
@@ -674,6 +679,21 @@ void syNetStateRunTick(void (*task_update)(void *), void *tfunc)
 			syNetStateLog("SSB64 NetState: stalling at tick %u, remote lag %u >= slots %u (stalls=%u)\n", cur,
 			              syNetInputGetRemoteLag(), sSYNetStateSlotCount, sSYNetStateStallCount);
 		}
+		syNetPeerPumpWhileStalled();
+		return;
+	}
+	/* Time sync: when we are further ahead of the peer than they are of us
+	 * by more than a frame, give one tick back now and then (at most one
+	 * per 20) so both machines run in step and predictions stay shallow,
+	 * instead of racing to the hard stall above. */
+	if (sSYNetStateTimeSyncCooldown != 0)
+	{
+		sSYNetStateTimeSyncCooldown--;
+	}
+	else if (syNetPeerGetAdvantageDelta() > 1)
+	{
+		sSYNetStateTimeSyncSkips++;
+		sSYNetStateTimeSyncCooldown = 20;
 		syNetPeerPumpWhileStalled();
 		return;
 	}
