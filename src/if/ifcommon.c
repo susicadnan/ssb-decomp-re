@@ -2692,6 +2692,20 @@ void ifCommonTimerFuncRun(GObj *interface_gobj)
     if (sIFCommonTimerIsStarted != FALSE)
     {
         time_update = sySchedulerGetTicCount();
+#ifdef PORT
+        /* Netplay: the clock is wall time (vertical retraces), and the
+         * machines in a session stall and catch up at different moments, so
+         * each would run out of time on a different tick. In a session the
+         * clock moves one tic per simulated tick instead. */
+        {
+            extern sb32 syNetStateCheckActive(void);
+
+            if (syNetStateCheckActive() != FALSE)
+            {
+                time_update = sIFCommonTimerStamp + 1;
+            }
+        }
+#endif
         time_delta = time_update - sIFCommonTimerStamp;
 
         if (time_delta != 0)
