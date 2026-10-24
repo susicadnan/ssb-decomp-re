@@ -7,6 +7,7 @@
 #include <PR/gu.h>
 
 #ifdef PORT
+#include <sys/netstate.h>
 #include "audio/audio_playback.h"
 #include "audio/audio_dma.h"
 #include "bridge/audio_bridge.h"
@@ -1759,12 +1760,32 @@ s32 syAudioCheckBGMPlaying(s32 sngplayer)
     else return TRUE;
 }
 
+#ifdef PORT
+/* syAudioPlayFGM hands out -1 when it cannot or must not start a sound; the
+ * game stores that id and feeds it back to the setters below. */
+static sb32 syAudioCheckSndPlayer(s32 sndplayer)
+{
+    return ((sndplayer >= 0) && (sndplayer < sSYAudioCurrentSettings.sndplayers_num)) ? TRUE : FALSE;
+}
+#else
+#define syAudioCheckSndPlayer(sndplayer) TRUE
+#endif
+
 s32 syAudioPlayFGM(u32 fgm)
 {
     s32 i;
 
 #ifdef PORT
     if (syAudioHasSoundPlayers() == FALSE)
+    {
+        return -1;
+    }
+    /* Rollback re-runs ticks that already played their sounds once; starting
+     * them again would double every hit. The id handed back is simulation
+     * state, so the re-simulated timeline carries -1 for these sounds and the
+     * sndplayer-indexed setters below tolerate it. (A sound a corrected input
+     * *should* have started is lost until a smarter dedup exists.) */
+    if (syNetStateCheckResimulating() != FALSE)
     {
         return -1;
     }
@@ -1826,7 +1847,7 @@ void func_80020EA0(s32 sndplayer, u32 arg1)
     {
         arg1 = 32767;
     }
-    if (sSYAudioSoundPlayers[sndplayer] != NULL)
+    if ((syAudioCheckSndPlayer(sndplayer) != FALSE) && (sSYAudioSoundPlayers[sndplayer] != NULL))
     {
         func_80026174_26D74(sSYAudioSoundPlayers[sndplayer], arg1 >> 8);
     }
@@ -1846,7 +1867,7 @@ void func_80020EF8(s32 sndplayer, s32 arg1)
     {
         var = 127;
     }
-    if (sSYAudioSoundPlayers[sndplayer] != NULL)
+    if ((syAudioCheckSndPlayer(sndplayer) != FALSE) && (sSYAudioSoundPlayers[sndplayer] != NULL))
     {
         func_80026104_26D04(sSYAudioSoundPlayers[sndplayer], var);
     }
@@ -1866,7 +1887,7 @@ void func_80020F4C(s32 sndplayer, s32 arg1)
     {
         var = 127;
     }
-    if (sSYAudioSoundPlayers[sndplayer] != NULL)
+    if ((syAudioCheckSndPlayer(sndplayer) != FALSE) && (sSYAudioSoundPlayers[sndplayer] != NULL))
     {
         func_80026094_26C94(sSYAudioSoundPlayers[sndplayer], var);
     }
@@ -1887,7 +1908,7 @@ void syAudioStopFGM(s32 sndplayer)
         return;
     }
 #endif
-    if (sSYAudioSoundPlayers[sndplayer] != NULL)
+    if ((syAudioCheckSndPlayer(sndplayer) != FALSE) && (sSYAudioSoundPlayers[sndplayer] != NULL))
     {
         func_80026738_27338(sSYAudioSoundPlayers[sndplayer]);
         sSYAudioSoundPlayers[sndplayer] = NULL;
@@ -1903,7 +1924,7 @@ void func_80020FFC(s32 sndplayer, u8 arg1)
         return;
     }
 #endif
-    if (sSYAudioSoundPlayers[sndplayer] != NULL)
+    if ((syAudioCheckSndPlayer(sndplayer) != FALSE) && (sSYAudioSoundPlayers[sndplayer] != NULL))
     {
         sSYAudioSoundPlayers[sndplayer]->unk_0x1F = arg1;
     }

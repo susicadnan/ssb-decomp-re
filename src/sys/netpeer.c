@@ -893,6 +893,7 @@ void syNetPeerStartVSSession(void)
 
 	syNetInputSetSlotSource(sSYNetPeerLocalPlayer, nSYNetInputSourceLocal);
 	syNetInputSetSlotSource(sSYNetPeerRemotePlayer, nSYNetInputSourceRemotePredicted);
+	syNetInputSetLocalDelay(sSYNetPeerInputDelay);
 
 	port_log("SSB64 NetPeer: VS session start role=%s local=%d remote=%d delay=%u barrier=%d tick=%u\n",
 	         (sSYNetPeerBootstrapIsHost != FALSE) ? "host" : "client",
@@ -918,11 +919,11 @@ sb32 syNetPeerCheckStartBarrierReleased(void)
 
 void syNetPeerBuildPacket(u8 *buffer, u32 *out_size)
 {
-	SYNetInputFrame published_frame;
-	SYNetInputFrame history_frame;
+	SYNetInputFrame queued_frame;
 	SYNetPeerPacketFrame frames[SYNETPEER_MAX_PACKET_FRAMES];
 	SYNetPeerPacketFrame zero_frame;
 	u8 *cursor = buffer;
+	u32 queued_count;
 	u32 latest_tick;
 	u32 checksum;
 	s32 frame_count = 0;
@@ -932,22 +933,28 @@ void syNetPeerBuildPacket(u8 *buffer, u32 *out_size)
 	memset(frames, 0, sizeof(frames));
 	memset(&zero_frame, 0, sizeof(zero_frame));
 
-	if (syNetInputGetPublishedFrame(sSYNetPeerLocalPlayer, &published_frame) == FALSE)
+	/* Send from the local input queue: each frame is tagged with the tick it
+	 * will be applied on (poll tick + input delay), which is the tick the
+	 * peer applies it on too. The input delay therefore lives entirely in
+	 * netinput; the wire carries application ticks. */
+	queued_count = syNetInputGetLocalQueuedCount(sSYNetPeerLocalPlayer);
+
+	if (queued_count == 0)
 	{
 		*out_size = 0;
 		return;
 	}
-	latest_tick = published_frame.tick;
+	latest_tick = queued_count - 1;
 
 	for (back = SYNETPEER_MAX_PACKET_FRAMES - 1; back >= 0; back--)
 	{
 		if ((latest_tick >= (u32)back) &&
-			(syNetInputGetHistoryFrame(sSYNetPeerLocalPlayer, latest_tick - back, &history_frame) != FALSE))
+			(syNetInputGetLocalQueuedFrame(sSYNetPeerLocalPlayer, latest_tick - back, &queued_frame) != FALSE))
 		{
-			frames[frame_count].tick = history_frame.tick + sSYNetPeerInputDelay;
-			frames[frame_count].buttons = history_frame.buttons;
-			frames[frame_count].stick_x = history_frame.stick_x;
-			frames[frame_count].stick_y = history_frame.stick_y;
+			frames[frame_count].tick = queued_frame.tick;
+			frames[frame_count].buttons = queued_frame.buttons;
+			frames[frame_count].stick_x = queued_frame.stick_x;
+			frames[frame_count].stick_y = queued_frame.stick_y;
 			frame_count++;
 		}
 	}
@@ -1385,6 +1392,20 @@ void syNetPeerUpdate(void)
 	}
 	syNetPeerSendLocalInput();
 	syNetPeerLogStats();
+}
+
+/* Called by sys/netstate.c instead of the tick while it stalls for a peer
+ * that has fallen further behind than the snapshot ring can roll back to:
+ * keep receiving (their inputs are what ends the stall) and keep sending
+ * (our queued inputs are what they are waiting for), nothing else. */
+void syNetPeerPumpWhileStalled(void)
+{
+	if (sSYNetPeerIsActive == FALSE)
+	{
+		return;
+	}
+	syNetPeerReceiveRemoteInput();
+	syNetPeerSendLocalInput();
 }
 
 void syNetPeerStopVSSession(void)

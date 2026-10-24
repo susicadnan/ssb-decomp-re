@@ -7,6 +7,9 @@
 #include "enhancements/enhancements.h"
 #include "sc/scmanager.h"
 #include "sc/sctypes.h"
+#ifdef PORT
+#include <sys/netstate.h>
+#endif
 
 // 0x800450F0
 OSMesgQueue sSYControllerInitMesgQueue; // Queue for OS controller Init, Status, and Read
@@ -370,6 +373,15 @@ void syControllerUpdateRumbleEvent(s32 port, s32 ev_kind)
 {
     s32 i;
     OSMesg msg;
+
+#ifdef PORT
+    /* Motor commands are a per-real-tick side effect; a re-simulated tick
+     * (rollback) must not toggle the pak again. */
+    if (syNetStateCheckResimulating() != FALSE)
+    {
+        return;
+    }
+#endif
 
     for (i = 0; i < MAXCONTROLLERS; i++)
     {

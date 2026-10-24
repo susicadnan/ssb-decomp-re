@@ -1,6 +1,7 @@
 #include <sys/netstate.h>
 
 #include <sys/netinput.h>
+#include <sys/netpeer.h>
 #include <sys/netsync.h>
 #include <sys/taskman.h>
 
@@ -85,6 +86,7 @@ static u32 sSYNetStateMaxRollbackDepth;
 static u32 sSYNetStateRollbackTooOldCount;
 static u32 sSYNetStateSyncTestRuns;
 static u32 sSYNetStateSyncTestMismatches;
+static u32 sSYNetStateStallCount;
 static u32 sSYNetStateLogCount;
 static size_t sSYNetStateMaxArenaUsed;
 
@@ -312,11 +314,12 @@ void syNetStateStartVSSession(void)
 	sSYNetStateRollbackTooOldCount = 0;
 	sSYNetStateSyncTestRuns = 0;
 	sSYNetStateSyncTestMismatches = 0;
+	sSYNetStateStallCount = 0;
 	sSYNetStateLogCount = 0;
 	sSYNetStateMaxArenaUsed = 0;
 
 	port_gobj_coroutine_set_rollback_active(1, syNetStateCoroTickFn);
-	port_netstate_host_begin();
+	port_netstate_host_begin(gPortSceneHeap, gPortSceneHeapSize);
 
 	syNetStateLog("SSB64 NetState: session start slots=%u globals=%zu bytes (%d ranges) arena_used=%zu synctest=%u\n",
 	              sSYNetStateSlotCount, sSYNetStateGlobalsBytes, sSYNetStateRangeCount, syNetStateGetArenaUsed(),
@@ -338,10 +341,10 @@ void syNetStateStopVSSession(void)
 
 	sSYNetStateLogCount = 0;
 	syNetStateLog("SSB64 NetState: session end saves=%u rollbacks=%u resim_ticks=%u max_depth=%u too_old=%u "
-	              "max_arena_used=%zu synctest_runs=%u synctest_mismatches=%u\n",
+	              "stalls=%u max_arena_used=%zu synctest_runs=%u synctest_mismatches=%u\n",
 	              sSYNetStateSaveCount, sSYNetStateRollbackCount, sSYNetStateResimTickCount,
-	              sSYNetStateMaxRollbackDepth, sSYNetStateRollbackTooOldCount, sSYNetStateMaxArenaUsed,
-	              sSYNetStateSyncTestRuns, sSYNetStateSyncTestMismatches);
+	              sSYNetStateMaxRollbackDepth, sSYNetStateRollbackTooOldCount, sSYNetStateStallCount,
+	              sSYNetStateMaxArenaUsed, sSYNetStateSyncTestRuns, sSYNetStateSyncTestMismatches);
 
 	syNetStateFreeSlots();
 }
@@ -646,6 +649,22 @@ void syNetStateRunTick(void (*task_update)(void *), void *tfunc)
 	}
 	cur = syNetInputGetTick();
 
+	/* Stall rather than outrun the ring: a misprediction can be as old as
+	 * the newest unconfirmed remote tick, and S(that tick) must still be
+	 * here next tick. Keep the transport moving meanwhile; their inputs are
+	 * what ends the stall and ours are what they wait for. */
+	if (syNetInputGetRemoteLag() + 2 > sSYNetStateSlotCount)
+	{
+		sSYNetStateStallCount++;
+
+		if ((sSYNetStateStallCount % 60) == 1)
+		{
+			syNetStateLog("SSB64 NetState: stalling at tick %u, remote lag %u >= slots %u (stalls=%u)\n", cur,
+			              syNetInputGetRemoteLag(), sSYNetStateSlotCount, sSYNetStateStallCount);
+		}
+		syNetPeerPumpWhileStalled();
+		return;
+	}
 	/* S(cur): the present, before this tick runs. Re-saved below if a
 	 * rollback rewrites the present. */
 	syNetStateSave(cur);
