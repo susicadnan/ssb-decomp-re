@@ -8,6 +8,7 @@ extern void port_coroutine_yield(void);
 #include <sys/netinput.h>
 #include <sys/netpeer.h>
 #include <sys/netreplay.h>
+#include <sys/netstate.h>
 #include <sys/netsync.h>
 #include <sys/video.h>
 #include <reloc_data.h>
@@ -107,6 +108,13 @@ SYTaskmanSetup dSCVSBattleTaskmanSetup =
 // 0x8018D0C0
 void scVSBattleFuncUpdate(void)
 {
+	/* A resimulated tick (rollback) is pure simulation: no packets, no trace
+	 * line, no replay I/O — those are per-real-tick side effects. */
+	if (syNetStateCheckResimulating() != FALSE)
+	{
+		ifCommonBattleUpdateInterfaceAll();
+		return;
+	}
 	syNetPeerUpdateBattleGate();
 
 	if (syNetPeerCheckBattleExecutionReady() == FALSE)
@@ -264,6 +272,7 @@ void scVSBattleStartBattle(void)
 	syNetReplayStartVSSession(gSCManagerBattleState);
 	syNetSyncStartVSSession();
 	syNetPeerStartVSSession();
+	syNetStateStartVSSession();
 
 	gSCManagerSceneData.is_reset = FALSE;
 	gSCManagerSceneData.is_suddendeath = FALSE;
@@ -706,6 +715,7 @@ void scVSBattleStartScene(void)
 		func_800266A0_272A0();
 		gmRumbleInitPlayers();
 	}
+	syNetStateStopVSSession();
 	syNetSyncFinishVSSession();
 	syNetReplayFinishVSSession();
 	syNetPeerStopVSSession();

@@ -20,6 +20,7 @@ extern void port_coroutine_yield(void);
 #include <sys/video.h>
 #include <sys/controller.h>
 #include <sys/netpeer.h>
+#include <sys/netstate.h>
 #include <sys/netreplay.h>
 #include <sys/netsync.h>
 #ifdef PORT
@@ -961,6 +962,7 @@ void scManagerRunLoop(sb32 arg)
 		syNetSyncInitDebugEnv();
 		syNetReplayInitDebugEnv();
 		syNetPeerInitDebugEnv();
+		syNetStateInitDebugEnv();
 	}
 
 	// boot straight to CSS if enabled

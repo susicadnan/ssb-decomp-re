@@ -16,6 +16,11 @@
 #include <PR/viint.h>
 #include <PR/sptask.h>
 #include <PR/ultratypes.h>
+#ifdef PORT
+#include <netstate_optin.h>
+#else
+#define SYNET_STATE_VAR
+#endif
 
 /*
     28 00 u32	type;
@@ -101,7 +106,9 @@ OSMesgQueue gSYSchedulerTaskMesgQueue;
 sb32 scUseCustomSwapBufferFunc;
 OSMesgQueue *scCustomSwapBufferQueue;
 void (*sSYSchedulerFuncReset)(void);
-u32 sSYSchedulerTicCount;
+/* Read by the VS match timer (ifcommon.c); rollback must rewind it with the
+ * simulation even though the rest of this TU is host-side scheduler state. */
+SYNET_STATE_VAR u32 sSYSchedulerTicCount;
 ub32 gSYSchedulerIsSoftReset; // gSoftReseting ..?
 s32 sSYSchedulerAfterPreNMI; // return of osAfterPreNMI
 void *sSYSchedulerReadyBuffers[3];

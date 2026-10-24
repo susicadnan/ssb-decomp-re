@@ -1,6 +1,7 @@
 #include <sys/netinput.h>
 
 #include <sys/netpeer.h>
+#include <sys/netstate.h>
 #include <sys/taskman.h>
 
 typedef struct SYNetInputSlot
@@ -33,6 +34,12 @@ u32 sSYNetInputPublishedChecksum;
 u32 sSYNetInputPublishedTickCount;
 u32 sSYNetInputPublishedChecksumLimit;
 u32 sSYNetInputPublishedChecksumAtLimit;
+/* TRUE while sys/netstate.c re-simulates ticks after a rollback: local slots
+ * then replay the input they actually had at that tick from sSYNetInputHistory
+ * instead of polling hardware, and the per-tick bookkeeping that rollback
+ * rewinds explicitly (tick, checksums, last_published) is driven by
+ * syNetInputRestoreState() rather than by the live advance. */
+sb32 sSYNetInputIsResimulating;
 
 u32 syNetInputGetTick(void)
 {
@@ -183,10 +190,31 @@ void syNetInputSetRemoteInput(s32 player, u32 tick, u16 buttons, s8 stick_x, s8 
 {
 	SYNetInputFrame frame;
 
-	if (syNetInputCheckPlayer(player) != FALSE)
+	SYNetInputFrame published;
+
+	if (syNetInputCheckPlayer(player) == FALSE)
 	{
-		syNetInputMakeFrame(&frame, tick, buttons, stick_x, stick_y, nSYNetInputSourceRemoteConfirmed, FALSE);
-		syNetInputStoreFrame(sSYNetInputRemoteHistory, player, &frame);
+		return;
+	}
+	syNetInputMakeFrame(&frame, tick, buttons, stick_x, stick_y, nSYNetInputSourceRemoteConfirmed, FALSE);
+	syNetInputStoreFrame(sSYNetInputRemoteHistory, player, &frame);
+
+	/* A confirmed input for a tick we already simulated: if the prediction we
+	 * published for it was wrong, the simulation from that tick on is wrong
+	 * and netstate must roll back and re-simulate. A correct prediction only
+	 * needs the history entry promoted to confirmed. */
+	if ((tick < sSYNetInputTick) && (syNetInputGetStoredFrame(sSYNetInputHistory, player, tick, &published) != FALSE)
+	    && (published.is_predicted != FALSE))
+	{
+		if ((published.buttons != buttons) || (published.stick_x != stick_x) || (published.stick_y != stick_y))
+		{
+			syNetStateRequestRollback(tick);
+		}
+		else
+		{
+			sSYNetInputHistory[player][tick % SYNETINPUT_HISTORY_LENGTH].is_predicted = FALSE;
+			sSYNetInputHistory[player][tick % SYNETINPUT_HISTORY_LENGTH].source = nSYNetInputSourceRemoteConfirmed;
+		}
 	}
 }
 
@@ -264,7 +292,13 @@ void syNetInputResolveFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
 
 	case nSYNetInputSourceLocal:
 	default:
-		syNetInputMakeLocalFrame(player, tick, out_frame);
+		if ((sSYNetInputIsResimulating != FALSE)
+		    && (syNetInputGetStoredFrame(sSYNetInputHistory, player, tick, out_frame) != FALSE))
+		{
+			out_frame->source = nSYNetInputSourceLocal;
+			out_frame->is_predicted = FALSE;
+		}
+		else syNetInputMakeLocalFrame(player, tick, out_frame);
 		break;
 	}
 }
@@ -538,7 +572,10 @@ void syNetInputFuncRead(void)
 	u32 tick;
 	s32 player;
 
-	syControllerFuncRead();
+	if (sSYNetInputIsResimulating == FALSE)
+	{
+		syControllerFuncRead();
+	}
 	tick = syNetInputGetTick();
 
 	for (player = 0; player < MAXCONTROLLERS; player++)
@@ -589,4 +626,46 @@ u32 syNetInputGetPublishedInputChecksum(void)
 		return sSYNetInputPublishedChecksumAtLimit;
 	}
 	return sSYNetInputPublishedChecksum;
+}
+
+void syNetInputSetResimulating(sb32 is_resimulating)
+{
+	sSYNetInputIsResimulating = is_resimulating;
+}
+
+sb32 syNetInputGetResimulating(void)
+{
+	return sSYNetInputIsResimulating;
+}
+
+void syNetInputSaveState(SYNetInputState *out_state)
+{
+	s32 player;
+
+	out_state->tick = sSYNetInputTick;
+	out_state->published_checksum = sSYNetInputPublishedChecksum;
+	out_state->published_tick_count = sSYNetInputPublishedTickCount;
+	out_state->published_checksum_at_limit = sSYNetInputPublishedChecksumAtLimit;
+
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		out_state->last_confirmed[player] = sSYNetInputSlots[player].last_confirmed;
+		out_state->last_published[player] = sSYNetInputSlots[player].last_published;
+	}
+}
+
+void syNetInputRestoreState(const SYNetInputState *state)
+{
+	s32 player;
+
+	sSYNetInputTick = state->tick;
+	sSYNetInputPublishedChecksum = state->published_checksum;
+	sSYNetInputPublishedTickCount = state->published_tick_count;
+	sSYNetInputPublishedChecksumAtLimit = state->published_checksum_at_limit;
+
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		sSYNetInputSlots[player].last_confirmed = state->last_confirmed[player];
+		sSYNetInputSlots[player].last_published = state->last_published[player];
+	}
 }

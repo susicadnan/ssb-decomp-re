@@ -9,6 +9,9 @@
 #include <sys/video.h>
 #include <sys/scheduler.h>
 #include <sys/controller.h>
+#ifdef PORT
+#include <sys/netstate.h>
+#endif
 
 #include <macros.h>
 #include <ssb_types.h>
@@ -1021,6 +1024,24 @@ void func_80005D10()
 }
 
 // 0x80005DA0
+#ifdef PORT
+/* Rollback (sys/netstate.c) sits between the tick clock and the tick: it may
+ * restore an older snapshot and re-run task_update several times before the
+ * real tick runs. Outside an active rollback session it is a plain call. */
+static void syTaskmanRunTaskUpdateThunk(void *tfunc)
+{
+	SYTaskFunction *t = (SYTaskFunction *)tfunc;
+	t->task_update(t);
+}
+
+static void syTaskmanRunTaskUpdate(SYTaskFunction *tfunc)
+{
+	syNetStateRunTick(syTaskmanRunTaskUpdateThunk, tfunc);
+}
+#else
+#define syTaskmanRunTaskUpdate(tfunc) ((tfunc)->task_update(tfunc))
+#endif
+
 void syTaskmanRunTask(SYTaskFunction *tfunc)
 {
 	s32 i;
@@ -1064,7 +1085,7 @@ void syTaskmanRunTask(SYTaskFunction *tfunc)
 			}
 			sSYTaskmanTimeStart = osGetCount();
 
-			tfunc->task_update(tfunc);
+			syTaskmanRunTaskUpdate(tfunc);
 
 			dSYTaskmanUpdateCount++;
 			sSYTaskmanUpdateTimeDelta = (osGetCount() - sSYTaskmanTimeStart) / 2971; // what is this constant?
@@ -1118,7 +1139,7 @@ void syTaskmanRunTask(SYTaskFunction *tfunc)
 		}
 		sSYTaskmanTimeStart = osGetCount();
 
-		tfunc->task_update(tfunc);
+		syTaskmanRunTaskUpdate(tfunc);
 
 		dSYTaskmanUpdateCount++;
 		sSYTaskmanUpdateTimeDelta = (osGetCount() - sSYTaskmanTimeStart) / 2971;
@@ -1406,6 +1427,12 @@ void syTaskmanStartTask(SYTaskmanSetup *tsetup)
 			efManagerPortClearFileRefs();
 		}
 	}
+#endif
+#ifdef PORT
+	/* The arena is about to be reused: any rollback session still holding
+	 * snapshots of it (a VS battle that ended through reset/quit rather than
+	 * the results screen) is over. */
+	syNetStateStopVSSession();
 #endif
 	syTaskmanInitGeneralHeap(tsetup->scene_setup.arena_start, tsetup->scene_setup.arena_size);
 

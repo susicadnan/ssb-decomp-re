@@ -61,6 +61,20 @@ typedef struct SYNetInputReplayMetadata
 
 } SYNetInputReplayMetadata;
 
+/* The per-tick bookkeeping rollback rewinds with the simulation (see
+ * sys/netstate.c). The history rings themselves are not part of it: they are
+ * indexed by tick and simply get overwritten when a tick is re-simulated. */
+typedef struct SYNetInputState
+{
+	u32 tick;
+	u32 published_checksum;
+	u32 published_tick_count;
+	u32 published_checksum_at_limit;
+	SYNetInputFrame last_confirmed[MAXCONTROLLERS];
+	SYNetInputFrame last_published[MAXCONTROLLERS];
+
+} SYNetInputState;
+
 extern void syNetInputReset(void);
 extern void syNetInputStartVSSession(void);
 extern u32 syNetInputGetTick(void);
@@ -88,5 +102,9 @@ extern u32 syNetInputGetPublishedInputChecksum(void);
 extern void syNetInputSetReplayMetadata(const SYNetInputReplayMetadata *metadata);
 extern sb32 syNetInputGetReplayMetadata(SYNetInputReplayMetadata *out_metadata);
 extern void syNetInputFuncRead(void);
+extern void syNetInputSetResimulating(sb32 is_resimulating);
+extern sb32 syNetInputGetResimulating(void);
+extern void syNetInputSaveState(SYNetInputState *out_state);
+extern void syNetInputRestoreState(const SYNetInputState *state);
 
 #endif /* _SYNETINPUT_H_ */
