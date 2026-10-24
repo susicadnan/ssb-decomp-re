@@ -11,6 +11,9 @@
 #include <sys/controller.h>
 #ifdef PORT
 #include <sys/netstate.h>
+#include <netstate_optin.h>
+#else
+#define SYNET_HOST_VAR
 #endif
 
 #include <macros.h>
@@ -76,7 +79,10 @@ typedef struct SYTaskFunction
 s32 dSYTaskmanRdpOutputBufferKind = 0;
 
 // 0x8003B6E4 - Total number of game updates
-u32 dSYTaskmanUpdateCount = 0;
+/* Host state, not simulation state: the port's framebuffer pacing and the
+ * game's own hang detector (debug thread 8) watch it advance, so rollback
+ * must never rewind it (see port/netstate_optin.h). */
+SYNET_HOST_VAR u32 dSYTaskmanUpdateCount = 0;
 
 // 0x8003B6E8 - Total number of drawn frames
 u32 dSYTaskmanFrameCount = 0;

@@ -939,6 +939,10 @@ void syDebugFileLoaderThread8(void *arg)
 
             if (count >= 300)
             {
+#ifdef PORT
+                port_log("SSB64: debug thread 8: game update count %u frozen for %d retraces — hang screen\n",
+                         (unsigned)dSYTaskmanUpdateCount, (int)count);
+#endif
                 dSYDebugIsScreenActive = TRUE;
                 origPri = osGetThreadPri(NULL);
                 osSetThreadPri(NULL, OS_PRIORITY_RMON);

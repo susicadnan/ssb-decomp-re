@@ -9,6 +9,7 @@
 #include "sc/sctypes.h"
 #ifdef PORT
 #include <sys/netstate.h>
+extern int port_watchdog_get_active_thread(void);
 #endif
 
 // 0x800450F0
@@ -308,6 +309,39 @@ void syControllerInitDevices(void)
     sSYControllerEventsRemainNum = sSYControllerStatusUpdateWait = 1;
 }
 
+#ifdef PORT
+/* For the watchdog's tick-stall report (port/port_watchdog.cpp). */
+void syControllerGetDiag(s32 *is_update_data, s32 *is_read_device_data, s32 *has_wait_update, s32 *events_remain,
+                         s32 *status_update_wait, s32 *event_queue_valid)
+{
+    *is_update_data = sSYControllerIsUpdateData;
+    *is_read_device_data = sSYControllerIsReadDeviceData;
+    *has_wait_update = (sSYControllerWaitUpdate != NULL) ? 1 : 0;
+    *events_remain = sSYControllerEventsRemainNum;
+    *status_update_wait = sSYControllerStatusUpdateWait;
+    *event_queue_valid = sSYControllerEventMesgQueue.validCount;
+}
+#endif
+
+#ifdef PORT
+/* Diagnostics: the dispatch currently waiting for its reply, so the reply
+ * paths can tell when they answer somebody else. */
+static ControllerEvent *sPortDispatchInFlight;
+static s32 sPortDispatchDepth;
+
+static void syControllerCheckReplyTarget(ControllerEvent *evt, const char *where)
+{
+    extern void port_log(const char *fmt, ...);
+    static s32 sLogged = 0;
+    if ((evt != sPortDispatchInFlight) && (sLogged < 8))
+    {
+        sLogged++;
+        port_log("SSB64 Controller: %s replies to evt=%p (type %d) but the waiting dispatch is %p (depth %d)\n",
+                 where, (void *)evt, (int)evt->type, (void *)sPortDispatchInFlight, (int)sPortDispatchDepth);
+    }
+}
+#endif
+
 // 0x80004284
 void syControllerDispatchEvent(ControllerEvent *evt)
 {
@@ -318,8 +352,63 @@ void syControllerDispatchEvent(ControllerEvent *evt)
     evt->mesg    = (OSMesg)1;
     evt->cbQueue = &queue;
 
+#ifdef PORT
+    {
+        extern void port_log(const char *fmt, ...);
+        static s32 sReentryLogged = 0;
+        sPortDispatchDepth++;
+        if ((sPortDispatchDepth > 1) && (sReentryLogged < 8))
+        {
+            sReentryLogged++;
+            extern int port_diag_current_thread(void);
+            port_log("SSB64 Controller: dispatch type %d while type %d is still waiting (depth %d, tid=%d, thread=%d)\n",
+                     (int)evt->type, sPortDispatchInFlight ? (int)sPortDispatchInFlight->type : -1,
+                     (int)sPortDispatchDepth, port_watchdog_get_active_thread(), port_diag_current_thread());
+        }
+        sPortDispatchInFlight = evt;
+    }
+    /* A full event queue would silently drop the request and park the caller
+     * on `queue` for good (the game thread hangs while frames keep pumping).
+     * Say so, then wait for room instead of losing the event. */
+    if (osSendMesg(&sSYControllerEventMesgQueue, (OSMesg)evt, OS_MESG_NOBLOCK) == -1)
+    {
+        extern void port_log(const char *fmt, ...);
+        static s32 sFullLogged = 0;
+        if (sFullLogged < 8)
+        {
+            s32 i;
+            sFullLogged++;
+            port_log("SSB64 Controller: event queue full (cap=%d) dispatching type %d; queued:",
+                     (int)sSYControllerEventMesgQueue.msgCount, (int)evt->type);
+            for (i = 0; i < sSYControllerEventMesgQueue.validCount; i++)
+            {
+                OSMesg m = sSYControllerEventMesgQueue.msg[(sSYControllerEventMesgQueue.first + i) % sSYControllerEventMesgQueue.msgCount];
+                if ((intptr_t)m == 1) port_log(" retrace");
+                else port_log(" type%d", (int)((ControllerEvent *)m)->type);
+            }
+            port_log("\n");
+        }
+        osSendMesg(&sSYControllerEventMesgQueue, (OSMesg)evt, OS_MESG_BLOCK);
+    }
+    if (osRecvMesg(&queue, NULL, OS_MESG_BLOCK) == -1)
+    {
+        extern void port_log(const char *fmt, ...);
+        static s32 sNoWaitLogged = 0;
+        if (sNoWaitLogged < 8)
+        {
+            sNoWaitLogged++;
+            port_log("SSB64 Controller: dispatch type %d could not wait for its reply (not in a coroutine)\n",
+                     (int)evt->type);
+        }
+        /* The controller thread still holds a pointer to `evt` and will
+         * answer into `queue` later; both are about to go out of scope. */
+    }
+    sPortDispatchDepth--;
+    if (sPortDispatchInFlight == evt) sPortDispatchInFlight = NULL;
+#else
     osSendMesg(&sSYControllerEventMesgQueue, (OSMesg)evt, OS_MESG_NOBLOCK);
     osRecvMesg(&queue, NULL, OS_MESG_BLOCK);
+#endif
 }
 
 void syControllerScheduleRead(void)
@@ -461,11 +550,14 @@ void syControllerParseEvent(ControllerEvent *evt)
                 syControllerUpdateGlobalData();
                 if (evt->cbQueue != NULL)
                 {
+#ifdef PORT
+                    syControllerCheckReplyTarget(evt, "update(now)");
+#endif
                     osSendMesg(evt->cbQueue, evt->mesg, OS_MESG_NOBLOCK);
                 }
             }
             else sSYControllerWaitUpdate = evt;
-            
+
             break;
         }
         case CONT_EVENT_UNK_3:
@@ -574,6 +666,9 @@ void syControllerThreadMain(void *unused)
 
             if (sSYControllerWaitUpdate->cbQueue != NULL)
             {
+#ifdef PORT
+                syControllerCheckReplyTarget(sSYControllerWaitUpdate, "update(retrace)");
+#endif
                 osSendMesg(sSYControllerWaitUpdate->cbQueue, sSYControllerWaitUpdate->mesg, OS_MESG_NOBLOCK);
             }
             sSYControllerWaitUpdate = NULL;

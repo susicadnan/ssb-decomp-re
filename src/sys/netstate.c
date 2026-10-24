@@ -25,6 +25,22 @@
 extern void port_log(const char *fmt, ...);
 /* The decomp stdlib.h shadow has no atoi; netpeer.c declares it the same way. */
 extern int atoi(const char *s);
+/* port/port_watchdog.cpp: tick liveness for the hang report. */
+extern void port_watchdog_note_tick(void);
+
+/* Where the driver is right now, readable from the watchdog thread. */
+enum
+{
+	nSYNetStatePhaseIdle,
+	nSYNetStatePhaseRollbackResim,
+	nSYNetStatePhaseSyncTestResim,
+	nSYNetStatePhaseLiveTick,
+	nSYNetStatePhaseStall,
+	nSYNetStatePhaseTimeSync,
+};
+static volatile u32 sSYNetStateDiagPhase;
+static volatile u32 sSYNetStateDiagTick;
+static volatile u32 sSYNetStateDiagResimTick;
 
 /* taskman.c (PORT): the one malloc'd block every scene arena lives in. */
 extern void *gPortSceneHeap;
@@ -381,6 +397,15 @@ u32 syNetStateGetRollbackSlots(void)
 	return sSYNetStateSlotCount;
 }
 
+void syNetStateGetDiag(u32 *phase, u32 *tick, u32 *resim_tick, u32 *rollbacks, u32 *synctest_runs)
+{
+	*phase = sSYNetStateDiagPhase;
+	*tick = sSYNetStateDiagTick;
+	*resim_tick = sSYNetStateDiagResimTick;
+	*rollbacks = sSYNetStateRollbackCount;
+	*synctest_runs = sSYNetStateSyncTestRuns;
+}
+
 u32 syNetStateGetOldestTick(void)
 {
 	u32 oldest = 0xFFFFFFFFU;
@@ -550,6 +575,12 @@ sb32 syNetStateRestore(u32 tick)
 		{
 			continue;
 		}
+		/* restore_set has just verified the registry still holds this exact
+		 * coroutine (address and serial); only then is its blob written. */
+		if (port_gobj_coroutine_check(rec->co, rec->serial) == 0)
+		{
+			continue;
+		}
 		port_coroutine_restore(rec->co, slot->coro_blobs + slot->coro_offsets[i]);
 	}
 	syNetInputRestoreState(&slot->input);
@@ -601,6 +632,7 @@ static sb32 syNetStateResimulate(u32 from, u32 to, void (*task_update)(void *), 
 
 	for (tick = from; tick < to; tick++)
 	{
+		sSYNetStateDiagResimTick = tick;
 		task_update(tfunc);
 		sSYNetStateResimTickCount++;
 
@@ -662,9 +694,11 @@ void syNetStateRunTick(void (*task_update)(void *), void *tfunc)
 	if (sSYNetStateIsActive == FALSE)
 	{
 		task_update(tfunc);
+		port_watchdog_note_tick();
 		return;
 	}
 	cur = syNetInputGetTick();
+	sSYNetStateDiagTick = cur;
 
 	/* Stall rather than outrun the ring: a misprediction can be as old as
 	 * the newest unconfirmed remote tick, and S(that tick) must still be
@@ -672,6 +706,7 @@ void syNetStateRunTick(void (*task_update)(void *), void *tfunc)
 	 * what ends the stall and ours are what they wait for. */
 	if (syNetInputGetRemoteLag() + 2 > sSYNetStateSlotCount)
 	{
+		sSYNetStateDiagPhase = nSYNetStatePhaseStall;
 		sSYNetStateStallCount++;
 
 		if ((sSYNetStateStallCount % 60) == 1)
@@ -692,6 +727,7 @@ void syNetStateRunTick(void (*task_update)(void *), void *tfunc)
 	}
 	else if (syNetPeerGetAdvantageDelta() > 1)
 	{
+		sSYNetStateDiagPhase = nSYNetStatePhaseTimeSync;
 		sSYNetStateTimeSyncSkips++;
 		sSYNetStateTimeSyncCooldown = 20;
 		syNetPeerPumpWhileStalled();
@@ -710,12 +746,17 @@ void syNetStateRunTick(void (*task_update)(void *), void *tfunc)
 		if (from < cur)
 		{
 			sSYNetStateRollbackCount++;
+			sSYNetStateDiagPhase = nSYNetStatePhaseRollbackResim;
 			syNetStateResimulate(from, cur, task_update, tfunc);
 		}
 	}
 	if ((sSYNetStateSyncTestDepth != 0) && (cur >= sSYNetStateSyncTestDepth))
 	{
+		sSYNetStateDiagPhase = nSYNetStatePhaseSyncTestResim;
 		syNetStateRunSyncTest(cur, task_update, tfunc);
 	}
+	sSYNetStateDiagPhase = nSYNetStatePhaseLiveTick;
 	task_update(tfunc);
+	sSYNetStateDiagPhase = nSYNetStatePhaseIdle;
+	port_watchdog_note_tick();
 }

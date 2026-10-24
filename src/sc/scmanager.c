@@ -1858,6 +1858,23 @@ void scManagerFuncPrint(void)
 // 0x800A3040
 void scManagerRunPrintGObjStatus(void)
 {
+#ifdef PORT
+	/* This is the game's panic screen (an allocation or lookup failed and the
+	 * caller loops here forever). On PC that reads as a silent hang, and the
+	 * controller polling it does collides with the game thread's own; leave
+	 * the caller's stack in the log so the failing check can be found. */
+	{
+		extern void port_log(const char *fmt, ...);
+		extern void port_dump_backtrace(void);
+		static s32 sLogged = 0;
+		if (sLogged < 3)
+		{
+			sLogged++;
+			port_log("SSB64: scManagerRunPrintGObjStatus (game panic screen) entered\n");
+			port_dump_backtrace();
+		}
+	}
+#endif
 	syDebugRunFuncPrint(scManagerFuncPrint);
 }
 

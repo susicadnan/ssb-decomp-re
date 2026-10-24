@@ -20,7 +20,10 @@
 #include <string.h>
 
 #ifdef PORT
+#include <netstate_optin.h>
 extern void port_log(const char *fmt, ...);
+#else
+#define SYNET_STATE_VAR
 #endif
 
 extern s32 sSYUtilsRandomSeed;
@@ -77,8 +80,11 @@ static FILE *sSYNetSyncTraceFile;
 /* Per-match creation serial for items and weapons. gobj->id is the object
  * KIND (nGCCommonKindItem etc.), not an instance id, so it cannot tell two
  * items apart; the managers stamp this into ITStruct/WPStruct.spawn_serial
- * at creation (PORT only). Reset at every VS session start. */
-static u32 sSYNetSyncSpawnSerial;
+ * at creation (PORT only). Reset at every VS session start. It is part of
+ * the simulation (a re-simulated spawn must get the serial the first run
+ * gave it) even though the rest of this TU is host-side, so it opts into
+ * the rollback state section. */
+SYNET_STATE_VAR static u32 sSYNetSyncSpawnSerial = 0;
 
 /* SSB64_SYNC_DUMP_TICK=N: log the identity-bearing fighter fields for ticks
  * N..N+2 so a divergence found by the trace can be attributed to a field. */
