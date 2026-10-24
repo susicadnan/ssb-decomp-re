@@ -3602,3 +3602,17 @@ void mnVSResultsStartScene(void)
 		syControllerStopRumble(i);
 	}
 }
+
+#ifdef PORT
+/* Netplay group sessions (sys/netpeer.c, winner stays on): the place a
+ * port finished in on the results screen just shown, 0 = first; -1 if the
+ * port was not in the match. */
+s32 portMNVSResultsGetPlace(s32 player)
+{
+	if ((player < 0) || (player >= GMCOMMON_PLAYERS_MAX) || (sMNVSResultsIsPresent[player] == FALSE))
+	{
+		return -1;
+	}
+	return sMNVSResultsPlaces[player];
+}
+#endif

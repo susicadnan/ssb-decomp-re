@@ -33,6 +33,21 @@ extern void syNetPeerRematchRequest(u8 my_fighter);
 extern s32 syNetPeerRematchStep(void);
 extern sb32 syNetPeerCheckPostMatch(void);
 extern sb32 syNetPeerCheckPeerWantsRematch(void);
+
+/* Group sessions: up to four people, the host is the hub (see netpeer.c). */
+#define SYNETPEER_MODE_ROTATION 0 /* 1v1, winner stays on, the rest watch */
+#define SYNETPEER_MODE_EVERYONE 1 /* everyone connected plays */
+extern void syNetPeerHostConfigure(intptr_t sock, u32 delay, u32 session_id, u32 seed);
+extern s32 syNetPeerHostAddMember(const PortNetAddr *addr, const char *code);
+extern void syNetPeerHostStartSession(void);
+extern void syNetPeerGuestConfigure(intptr_t sock, const PortNetAddr *host, u32 delay, u32 session_id);
+extern sb32 syNetPeerServiceRound(void);
+extern void syNetPeerOnMatchCycleEnd(void);
+extern sb32 syNetPeerCheckRoundBusy(void);
+extern void syNetPeerReportStall(const char *reason);
+extern sb32 syNetPeerCheckSpectating(void);
+extern sb32 syNetPeerCheckGroupHost(void);
+extern s32 syNetPeerGetMemberInfo(s32 member, const char **code, s32 *slot, s32 *queue_pos, sb32 *is_me);
 #endif
 
 #endif /* _SYNETPEER_H_ */

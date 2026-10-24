@@ -108,6 +108,15 @@ SYTaskmanSetup dSCVSBattleTaskmanSetup =
 // 0x8018D0C0
 void scVSBattleFuncUpdate(void)
 {
+#ifdef PORT
+	/* Netplay: stage hazards off is part of the simulation (live and
+	 * re-simulated ticks alike), not a between-frames patch. */
+	{
+		extern void port_enhancement_stage_hazards_sim_tick(void);
+
+		port_enhancement_stage_hazards_sim_tick();
+	}
+#endif
 	/* A resimulated tick (rollback) is pure simulation: no packets, no trace
 	 * line, no replay I/O — those are per-real-tick side effects. */
 	if (syNetStateCheckResimulating() != FALSE)

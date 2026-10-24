@@ -24,8 +24,10 @@ extern void port_coroutine_yield(void);
 sb32 sSYNetMenuIsActive;
 s32 sSYNetMenuArmScene;  /* -1 once ticking */
 u32 sSYNetMenuSeed;
-s32 sSYNetMenuLocalPlayer;
-s32 sSYNetMenuRemotePlayer;
+sb32 sSYNetMenuArmNeedsStart; /* the arm scene must be started anew first (a reset is under way) */
+s32 sSYNetMenuLocalPlayer;   /* -1 = watching */
+u32 sSYNetMenuRemoteMask;    /* ports someone else plays */
+s32 sSYNetMenuLastScene;
 u32 sSYNetMenuDelay;
 u32 sSYNetMenuWaitRun;   /* consecutive frames spent waiting for the peer */
 u32 sSYNetMenuWaitTotal;
@@ -40,21 +42,35 @@ static s32 syNetMenuHardwarePort(void)
 	return (gSYControllerDeviceStatuses[0] >= 0) ? gSYControllerDeviceStatuses[0] : 0;
 }
 
-void syNetMenuStart(s32 local_player, s32 remote_player, u32 delay, s32 arm_scene, u32 seed)
+void syNetMenuStart(s32 local_player, u32 remote_mask, u32 delay, s32 arm_scene, u32 seed, sb32 arm_after_scene_start)
 {
+	s32 player;
+
 	sSYNetMenuSeed = seed;
 	syNetInputReset();
-	syNetInputSetSlotSource(local_player, nSYNetInputSourceLocal);
-	syNetInputSetSlotSource(remote_player, nSYNetInputSourceRemoteConfirmed);
+
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		if (remote_mask & (1 << player))
+		{
+			syNetInputSetSlotSource(player, nSYNetInputSourceRemoteConfirmed);
+		}
+	}
+	if (local_player >= 0)
+	{
+		syNetInputSetSlotSource(local_player, nSYNetInputSourceLocal);
+	}
 	syNetInputSetLocalDelay(delay);
 	/* Whoever we are, our controller is in port 1 (the first connected one). */
 	syNetInputSetLocalHardwarePort(syNetMenuHardwarePort());
 	syNetInputSetResimulating(FALSE);
 
 	sSYNetMenuLocalPlayer = local_player;
-	sSYNetMenuRemotePlayer = remote_player;
+	sSYNetMenuRemoteMask = remote_mask;
 	sSYNetMenuDelay = delay;
 	sSYNetMenuArmScene = arm_scene;
+	sSYNetMenuArmNeedsStart = arm_after_scene_start;
+	sSYNetMenuLastScene = -1;
 	sSYNetMenuWaitRun = 0;
 	sSYNetMenuWaitTotal = 0;
 	sSYNetMenuTicks = 0;
@@ -73,8 +89,8 @@ void syNetMenuStart(s32 local_player, s32 remote_player, u32 delay, s32 arm_scen
 			sSYNetInputFakeLocal = FALSE;
 		}
 	}
-	port_log("SSB64 NetMenu: lockstep start local=%d remote=%d delay=%u arm_scene=%d\n", local_player,
-	         remote_player, delay, arm_scene);
+	port_log("SSB64 NetMenu: lockstep start local=%d remote_mask=0x%x delay=%u arm_scene=%d after_start=%d\n",
+	         local_player, remote_mask, delay, arm_scene, arm_after_scene_start);
 #endif
 }
 
@@ -119,6 +135,36 @@ sb32 syNetMenuCheckOnlinePanelScene(void)
 sb32 syNetMenuCheckBattleScene(void)
 {
 	return (gSCManagerSceneData.scene_curr == nSCKindVSBattle) ? TRUE : FALSE;
+}
+
+/* sys/taskman.c, at every scene start. */
+void syNetMenuNoteSceneStart(void)
+{
+	sSYNetMenuArmNeedsStart = FALSE;
+}
+
+/* Ports that hold a player this round: the menus see a controller there. */
+static u32 syNetMenuPlayerMask(void)
+{
+	return sSYNetMenuRemoteMask | ((sSYNetMenuLocalPlayer >= 0) ? (1 << sSYNetMenuLocalPlayer) : 0);
+}
+
+static void syNetMenuPublishDeviceStatuses(void)
+{
+	u32 mask = syNetMenuPlayerMask();
+	s32 player;
+
+	gSYControllerConnectedNum = 0;
+
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		if (mask & (1 << player))
+		{
+			gSYControllerDeviceStatuses[player] = player;
+			gSYControllerConnectedNum++;
+		}
+		else gSYControllerDeviceStatuses[player] = -1;
+	}
 }
 
 #ifdef PORT
@@ -183,7 +229,6 @@ static void syNetMenuBotOverride(u32 tick)
 sb32 syNetMenuFuncRead(void)
 {
 	SYNetInputFrame frame;
-	SYNetInputFrame remote_frame;
 	u32 tick = syNetInputGetTick();
 	s32 player;
 
@@ -195,11 +240,13 @@ sb32 syNetMenuFuncRead(void)
 	 * cadence; the values are only sampled once per tick, below. */
 	syControllerFuncRead();
 
-	/* Until both players are in the scene they were sent to, the scene
-	 * being torn down keeps its own controllers and no tick is spent. */
+	/* Until everyone is in the scene they were sent to, the scene being torn
+	 * down keeps its own controllers and no tick is spent. After a reset the
+	 * scene must also have started again: the old instance of the same
+	 * scene may still run a frame. */
 	if (sSYNetMenuArmScene >= 0)
 	{
-		if (gSCManagerSceneData.scene_curr != sSYNetMenuArmScene)
+		if ((sSYNetMenuArmNeedsStart != FALSE) || (gSCManagerSceneData.scene_curr != sSYNetMenuArmScene))
 		{
 			return TRUE;
 		}
@@ -208,6 +255,25 @@ sb32 syNetMenuFuncRead(void)
 		port_log("SSB64 NetMenu: ticking from scene %d\n", (int)gSCManagerSceneData.scene_curr);
 #endif
 	}
+	/* A round exchange (sys/netpeer.c) holds the menus until it is through;
+	 * applying a round restarts this lockstep for the scene it resets to. */
+	if ((syNetPeerServiceRound() != FALSE) || (syNetPeerCheckRoundBusy() != FALSE))
+	{
+		return FALSE;
+	}
+	/* The results screen just gave way to the character select: a round
+	 * ends here (every member sees it on the same tick). */
+	if ((sSYNetMenuLastScene == nSCKindVSResults) && (gSCManagerSceneData.scene_curr != nSCKindVSResults))
+	{
+		sSYNetMenuLastScene = gSCManagerSceneData.scene_curr;
+		syNetPeerOnMatchCycleEnd();
+
+		if (syNetPeerCheckRoundBusy() != FALSE)
+		{
+			return FALSE;
+		}
+	}
+	sSYNetMenuLastScene = gSCManagerSceneData.scene_curr;
 	/* First shared tick: the two machines ran different things until here
 	 * (each was somewhere else when the connection came up), so align the
 	 * RNG now; the character select spreads the tokens with it. */
@@ -216,12 +282,12 @@ sb32 syNetMenuFuncRead(void)
 		syUtilsSetRandomSeed((s32)sSYNetMenuSeed);
 	}
 #ifdef PORT
-	if (sSYNetMenuBot != FALSE)
+	if ((sSYNetMenuBot != FALSE) && (sSYNetMenuLocalPlayer >= 0))
 	{
 		syNetMenuBotOverride(tick);
 	}
 #endif
-	if (syNetInputGetLocalQueuedCount(sSYNetMenuLocalPlayer) <= tick + sSYNetMenuDelay)
+	if ((sSYNetMenuLocalPlayer >= 0) && (syNetInputGetLocalQueuedCount(sSYNetMenuLocalPlayer) <= tick + sSYNetMenuDelay))
 	{
 		syNetInputQueueLocalFrame(sSYNetMenuLocalPlayer, tick);
 	}
@@ -235,7 +301,7 @@ sb32 syNetMenuFuncRead(void)
 
 	for (;;)
 	{
-		/* Receive the peer's frames and (re)send ours. */
+		/* Receive everyone's frames and (re)send ours. */
 		syNetPeerPumpWhileStalled();
 #ifdef PORT
 		syNetPeerSendPeriodicPing();
@@ -244,7 +310,20 @@ sb32 syNetMenuFuncRead(void)
 		{
 			return TRUE; /* the session ended while we waited */
 		}
-		if (syNetInputGetRemoteFrame(sSYNetMenuRemotePlayer, tick, &frame) != FALSE)
+		/* A round came through while we waited: everyone is being reset
+		 * into a scene and this lockstep starts over there. */
+		if (sSYNetMenuArmScene >= 0)
+		{
+			return FALSE;
+		}
+		for (player = 0; player < MAXCONTROLLERS; player++)
+		{
+			if ((sSYNetMenuRemoteMask & (1 << player)) && (syNetInputGetRemoteFrame(player, tick, &frame) == FALSE))
+			{
+				break;
+			}
+		}
+		if (player == MAXCONTROLLERS)
 		{
 			break;
 		}
@@ -254,9 +333,9 @@ sb32 syNetMenuFuncRead(void)
 		if (sSYNetMenuWaitRun >= SYNETMENU_DISCONNECT_FRAMES)
 		{
 #ifdef PORT
-			port_log("SSB64 NetMenu: no input from the peer for %u frames at tick %u\n", sSYNetMenuWaitRun, tick);
+			port_log("SSB64 NetMenu: no input from port %d for %u frames at tick %u\n", player + 1, sSYNetMenuWaitRun, tick);
 			sSYNetMenuWaitRun = 0;
-			syNetPeerAbortMatch("connection lost");
+			syNetPeerReportStall("connection lost");
 #endif
 			return FALSE;
 		}
@@ -267,13 +346,11 @@ sb32 syNetMenuFuncRead(void)
 #endif
 	}
 
-	remote_frame = frame;
-
 	for (player = 0; player < MAXCONTROLLERS; player++)
 	{
-		if (player == sSYNetMenuRemotePlayer)
+		if ((sSYNetMenuRemoteMask & (1 << player)) && (syNetInputGetRemoteFrame(player, tick, &frame) != FALSE))
 		{
-			syNetInputPublishFrame(player, &remote_frame);
+			syNetInputPublishFrame(player, &frame);
 		}
 		else if ((player == sSYNetMenuLocalPlayer)
 		         && (syNetInputGetLocalQueuedFrame(player, tick, &frame) != FALSE))
@@ -286,12 +363,9 @@ sb32 syNetMenuFuncRead(void)
 			syNetInputPublishFrame(player, &frame);
 		}
 	}
-	/* Exactly two controllers, in ports 1 and 2, on both machines. */
-	gSYControllerDeviceStatuses[0] = 0;
-	gSYControllerDeviceStatuses[1] = 1;
-	gSYControllerDeviceStatuses[2] = -1;
-	gSYControllerDeviceStatuses[3] = -1;
-	gSYControllerConnectedNum = 2;
+	/* The same controllers in the same ports on every machine: one per
+	 * player of this round, none for anyone watching. */
+	syNetMenuPublishDeviceStatuses();
 	syNetInputPublishMainController();
 
 	syNetInputSetTick(tick + 1);

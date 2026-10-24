@@ -812,6 +812,25 @@ u32 syNetInputGetRemoteLag(void)
 	return lag;
 }
 
+/* Every remote slot's confirmed input reaches tick: it can be simulated
+ * without predicting anything. */
+sb32 syNetInputCheckRemoteConfirmed(u32 tick)
+{
+	s32 player;
+
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		SYNetInputSource source = sSYNetInputSlots[player].source;
+
+		if (((source == nSYNetInputSourceRemoteConfirmed) || (source == nSYNetInputSourceRemotePredicted)) &&
+		    (sSYNetInputRemoteConfirmedCount[player] <= tick))
+		{
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+
 void syNetInputSetLocalHardwarePort(s32 port)
 {
 	sSYNetInputLocalHardwarePort = ((port >= 0) && (port < MAXCONTROLLERS)) ? port : -1;

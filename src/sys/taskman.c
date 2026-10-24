@@ -1464,6 +1464,7 @@ void syTaskmanStartTask(SYTaskmanSetup *tsetup)
 	 * snapshots of it (a VS battle that ended through reset/quit rather than
 	 * the results screen) is over. */
 	syNetStateStopVSSession();
+	syNetMenuNoteSceneStart();
 #endif
 	syTaskmanInitGeneralHeap(tsetup->scene_setup.arena_start, tsetup->scene_setup.arena_size);
 

@@ -52,6 +52,7 @@ extern int syNetStateSectionGetRanges(void **starts, size_t *sizes, int max_rang
 #define SYNETSTATE_RANGES_MAX 4
 #define SYNETSTATE_LOG_LIMIT 32
 #define SYNETSTATE_DISCONNECT_FRAMES 600
+#define SYNETSTATE_SPECTATOR_BUFFER 4 /* ticks a spectator holds in hand before its first */
 
 typedef struct SYNetStateSlot
 {
@@ -703,6 +704,7 @@ static void syNetStateRunSyncTest(u32 cur, void (*task_update)(void *), void *tf
 void syNetStateRunTick(void (*task_update)(void *), void *tfunc)
 {
 	u32 cur;
+	sb32 is_spectating;
 
 	if (sSYNetStateIsActive == FALSE)
 	{
@@ -712,12 +714,19 @@ void syNetStateRunTick(void (*task_update)(void *), void *tfunc)
 	}
 	cur = syNetInputGetTick();
 	sSYNetStateDiagTick = cur;
+	is_spectating = syNetPeerCheckSpectating();
 
 	/* Stall rather than outrun the ring: a misprediction can be as old as
 	 * the newest unconfirmed remote tick, and S(that tick) must still be
 	 * here next tick. Keep the transport moving meanwhile; their inputs are
-	 * what ends the stall and ours are what they wait for. */
-	if (syNetInputGetRemoteLag() + 2 > sSYNetStateSlotCount)
+	 * what ends the stall and ours are what they wait for.
+	 *
+	 * Watching (a spectator of a group session, sys/netpeer.c): never
+	 * predict. Each tick waits until every player's input for it is in, so
+	 * a spectator's game is the players' game, only a little behind. The
+	 * first tick also waits for a few more, a small buffer against jitter. */
+	if ((is_spectating != FALSE) ? (syNetInputCheckRemoteConfirmed(cur + ((cur == 0) ? SYNETSTATE_SPECTATOR_BUFFER : 0)) == FALSE)
+	                             : (syNetInputGetRemoteLag() + 2 > sSYNetStateSlotCount))
 	{
 		sSYNetStateDiagPhase = nSYNetStatePhaseStall;
 		sSYNetStateStallCount++;
@@ -735,7 +744,7 @@ void syNetStateRunTick(void (*task_update)(void *), void *tfunc)
 			port_log("SSB64 NetState: no input from the peer for %u frames at tick %u — disconnecting\n",
 			         sSYNetStateStallRun, cur);
 			sSYNetStateStallRun = 0;
-			syNetPeerAbortMatch("connection lost");
+			syNetPeerReportStall("connection lost");
 			return;
 		}
 		syNetPeerPumpWhileStalled();
@@ -750,7 +759,7 @@ void syNetStateRunTick(void (*task_update)(void *), void *tfunc)
 	{
 		sSYNetStateTimeSyncCooldown--;
 	}
-	else if (syNetPeerGetAdvantageDelta() > 1)
+	else if ((is_spectating == FALSE) && (syNetPeerGetAdvantageDelta() > 1))
 	{
 		sSYNetStateDiagPhase = nSYNetStatePhaseTimeSync;
 		sSYNetStateTimeSyncSkips++;

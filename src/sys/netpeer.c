@@ -24,7 +24,7 @@ extern void port_log(const char *fmt, ...);
 #endif
 
 #define SYNETPEER_MAGIC 0x53534E50 // SSNP
-#define SYNETPEER_VERSION 4 // 4: MATCH_CONFIG also carries the host's unlock and fighter masks
+#define SYNETPEER_VERSION 5 // 5: up to four members per session through the host, rounds, spectators
 #define SYNETPEER_MAX_PACKET_FRAMES 16
 #define SYNETPEER_FRAME_BYTES 8
 #define SYNETPEER_INPUT_HEADER_BYTES (4 + 2 + 2 + 4 + 4 + 4 + 1 + 1 + 1 + 1)
@@ -56,6 +56,38 @@ extern void port_log(const char *fmt, ...);
 /* PING/PONG: control header + a u32 millisecond stamp the peer echoes back. */
 #define SYNETPEER_PING_PACKET_BYTES (4 + 2 + 2 + 4 + 4 + 4)
 #define SYNETPEER_PING_INTERVAL_FRAMES 30
+
+/* ---- Groups: up to four people in one session ----
+ * The host is the hub. Every guest talks to the host only; the host sends
+ * its own packets to every guest and forwards each guest's input packets to
+ * the others, so nobody needs to reach anyone but the host. Each person is a
+ * "member" (0 = the host). Who plays which port and who watches is decided
+ * per round: a round starts with the host's ROUND_CONFIG (roster, rules,
+ * seed, the scene to reset to), every member answers READY, the host sends
+ * ROUND_START and everyone resets into the character select (the VS menu for
+ * the first round) in lockstep. A round ends when the results screen does;
+ * the host rotates (winner stays on), takes in anyone who joined meanwhile,
+ * drops anyone who left, and starts the next one. Spectators receive all
+ * the players' inputs and simulate the same game, only ever on confirmed
+ * input (sys/netstate.c), and never send input, so nobody waits for them. */
+#define SYNETPEER_MAX_MEMBERS 4
+#define SYNETPEER_CODE_BYTES 16
+#define SYNETPEER_PACKET_ROUND_CONFIG 9
+#define SYNETPEER_PACKET_ROUND_START 10 /* control-sized */
+#define SYNETPEER_PACKET_BYE 11         /* control-sized, any session */
+#define SYNETPEER_ROSTER_ENTRY_BYTES (1 + 1 + 1 + 1 + SYNETPEER_CODE_BYTES)
+#define SYNETPEER_ROUND_PACKET_BYTES                                                                                  \
+	(4 + 2 + 2 + 4 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 4 + (SYNETPEER_MAX_MEMBERS * SYNETPEER_ROSTER_ENTRY_BYTES) +        \
+	 SYNETPEER_METADATA_BYTES + 4 + 4 + 4)
+#define SYNETPEER_MAX_DATAGRAM 512
+#define SYNETPEER_ROUND_RESEND_FRAMES 6
+#define SYNETPEER_ROUND_START_REPEAT 30
+#define SYNETPEER_ROUND_MEMBER_TIMEOUT_MS 10000
+#define SYNETPEER_SILENT_MS 5000         /* a member this quiet while we wait on them is gone */
+#define SYNETPEER_HOST_SILENT_MS 15000   /* a guest gives up on a host this quiet */
+#define SYNETPEER_EARLY_FRAMES 256
+#define SYNETPEER_ROUND_FLAG_PRESET 0x1
+#define SYNETPEER_SLOT_NONE 0xFF
 
 typedef struct SYNetPeerPacketFrame
 {
@@ -159,6 +191,98 @@ u16 sSYNetPeerSavedFighterMask;
 u32 sSYNetPeerPeerUnlockMask;
 u32 sSYNetPeerPeerFighterMask;
 extern void port_coroutine_yield(void);
+
+typedef struct SYNetPeerMember
+{
+	sb32 is_used;      /* host: a guest that reached us; guest: entry 0 is the host, the rest roster only */
+	sb32 is_in_round;  /* takes part in the current round, as a player or watching */
+	PortNetAddr addr;  /* host: the guest's; guest: only entry 0 (the host) */
+	char code[SYNETPEER_CODE_BYTES];
+	s32 slot;          /* player slot this round, -1 = watching */
+	s32 queue_pos;     /* winner-stays-on queue position, -1 = not waiting */
+	u32 last_heard_ms;
+	u32 ping_ms;
+	sb32 is_ready;     /* READY for the exchange of the current session id */
+	sb32 is_battle_ready;
+	sb32 is_battle_start;
+
+} SYNetPeerMember;
+
+SYNetPeerMember sSYNetPeerMembers[SYNETPEER_MAX_MEMBERS];
+s32 sSYNetPeerMyMember;
+sb32 sSYNetPeerIsHub;          /* we are the host of a session: every packet goes through us */
+u32 sSYNetPeerRemoteMask;      /* player slots someone else drives this round */
+s32 sSYNetPeerSlotOwner[MAXCONTROLLERS];
+u32 sSYNetPeerSlotHighestTick[MAXCONTROLLERS];
+sb32 sSYNetPeerSlotHasTick[MAXCONTROLLERS];
+s32 sSYNetPeerSlotAdvantage[MAXCONTROLLERS];
+sb32 sSYNetPeerSlotAdvantageValid[MAXCONTROLLERS];
+sb32 sSYNetPeerBattleRunning;  /* a menu-mode battle is between its start and stop */
+u8 sSYNetPeerGroupMode;        /* SYNETPEER_MODE_* of the current round */
+u8 sSYNetPeerRoundFlags;
+/* Winner stays on (host): who holds ports 1 and 2, who is waiting, in order. */
+s32 sSYNetPeerRotPlayers[2];
+s32 sSYNetPeerRotKing;
+s32 sSYNetPeerQueue[SYNETPEER_MAX_MEMBERS];
+s32 sSYNetPeerQueueCount;
+u8 sSYNetPeerRotMode;
+sb32 sSYNetPeerRotValid;
+/* Round exchange. Host: 1 = collecting READY. Guest: 1 = holding a config,
+ * READY sent, waiting for ROUND_START. */
+s32 sSYNetPeerRoundState;
+sb32 sSYNetPeerRoundApplyPending;
+sb32 sSYNetPeerRoundAwaiting;  /* guest: at a round boundary, waiting for the host's next round */
+sb32 sSYNetPeerRoundFailed;
+u32 sSYNetPeerRoundsApplied;
+u32 sSYNetPeerRoundFrames;
+u32 sSYNetPeerRoundStartMs;
+u32 sSYNetPeerRoundStartRepeat;
+u32 sSYNetPeerRoundSession;
+u32 sSYNetPeerLastPingMs;      /* host-silence clock for a guest's own pings */
+/* The round being set up (host: built; guest: as received). */
+typedef struct SYNetPeerRound
+{
+	u32 session_id;
+	u32 session_base;
+	u32 session_phase;
+	u8 your_member;
+	u8 mode;
+	u8 flags;
+	u8 scene;
+	u8 scene_prev;
+	u32 seed;
+	u8 used[SYNETPEER_MAX_MEMBERS];
+	u8 in_round[SYNETPEER_MAX_MEMBERS];
+	u8 slot[SYNETPEER_MAX_MEMBERS];
+	u8 queue_pos[SYNETPEER_MAX_MEMBERS];
+	char code[SYNETPEER_MAX_MEMBERS][SYNETPEER_CODE_BYTES];
+	SYNetInputReplayMetadata metadata;
+	u32 unlock_mask;
+	u32 fighter_mask;
+
+} SYNetPeerRound;
+
+SYNetPeerRound sSYNetPeerRound;
+/* Input frames for the next session that arrive before we get there (a
+ * player already on the results screen while we finish the battle). */
+u32 sSYNetPeerEarlySession;
+SYNetPeerPacketFrame sSYNetPeerEarlyFrames[MAXCONTROLLERS][SYNETPEER_EARLY_FRAMES];
+sb32 sSYNetPeerEarlyValid[MAXCONTROLLERS][SYNETPEER_EARLY_FRAMES];
+
+/* port/netplay/lobby.cpp */
+extern void port_lobby_host_foreign_datagram(intptr_t sock, const u8 *buffer, s32 size, const PortNetAddr *from);
+extern s32 port_lobby_group_mode(void);
+extern s32 port_lobby_preset(void);
+extern const char *port_lobby_code(void);
+extern void port_lobby_notify_round(void);
+/* port/enhancements/DisableStageHazards.cpp */
+extern void port_netplay_set_hazards_off(s32 is_off);
+/* mn/mnvsmode/mnvsresults.c */
+extern s32 portMNVSResultsGetPlace(s32 player);
+extern void portSCManagerRequestResetTo(s32 scene, s32 scene_prev);
+
+void syNetPeerApplySlots(void);
+void syNetPeerHostStartRound(sb32 after_match, s32 scene, s32 scene_prev);
 #endif
 
 u32 syNetPeerChecksumAccumulateU32(u32 checksum, u32 value)
@@ -379,14 +503,49 @@ sb32 syNetPeerOpenSocket(void)
 	return (sSYNetPeerSocket >= 0) ? TRUE : FALSE;
 }
 
-/* Drain every queued datagram into handler. Returns FALSE on a socket error
- * (counted as a drop); FALSE is also what an empty queue returns so callers
- * just stop. */
-void syNetPeerReceiveAll(void (*handler)(const u8 *, s32), u8 *buffer, s32 capacity)
+sb32 syNetPeerCheckSameAddr(const PortNetAddr *a, const PortNetAddr *b)
 {
+	return ((a->ip == b->ip) && (a->port == b->port)) ? TRUE : FALSE;
+}
+
+/* Which member a datagram came from: the host hears from its guests, a
+ * guest only from the host (entry 0). -1 = a stranger. */
+s32 syNetPeerFindMember(const PortNetAddr *from)
+{
+	s32 i;
+
+	if (sSYNetPeerIsHub == FALSE)
+	{
+		return ((sSYNetPeerMembers[0].is_used != FALSE) && (syNetPeerCheckSameAddr(from, &sSYNetPeerMembers[0].addr) != FALSE)) ? 0 : -1;
+	}
+	for (i = 1; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		if ((sSYNetPeerMembers[i].is_used != FALSE) && (syNetPeerCheckSameAddr(from, &sSYNetPeerMembers[i].addr) != FALSE))
+		{
+			return i;
+		}
+	}
+	return -1;
+}
+
+void syNetPeerHandleDatagram(const u8 *buffer, s32 size, s32 member);
+
+/* Drain every queued datagram. A host passes anything that is not ours
+ * (the lobby's PUNCH of someone joining late) to the lobby. */
+void syNetPeerReceiveAll(void)
+{
+	u8 buffer[SYNETPEER_MAX_DATAGRAM];
+
+	if (sSYNetPeerSocket < 0)
+	{
+		return;
+	}
 	while (TRUE)
 	{
-		s32 size = port_netsock_recvfrom(sSYNetPeerSocket, buffer, capacity, NULL);
+		PortNetAddr from;
+		s32 size = port_netsock_recvfrom(sSYNetPeerSocket, buffer, sizeof(buffer), &from);
+		s32 member;
+		sb32 is_ours;
 
 		if (size <= 0)
 		{
@@ -396,8 +555,107 @@ void syNetPeerReceiveAll(void (*handler)(const u8 *, s32), u8 *buffer, s32 capac
 			}
 			break;
 		}
-		handler(buffer, size);
+		is_ours = ((size >= 4) && (buffer[0] == 'S') && (buffer[1] == 'S') && (buffer[2] == 'N') && (buffer[3] == 'P')) ? TRUE : FALSE;
+		member = syNetPeerFindMember(&from);
+
+		if (member >= 0)
+		{
+			sSYNetPeerMembers[member].last_heard_ms = port_netsock_now_ms();
+		}
+		if (is_ours == FALSE)
+		{
+			if (sSYNetPeerIsHub != FALSE)
+			{
+				port_lobby_host_foreign_datagram(sSYNetPeerSocket, buffer, size, &from);
+			}
+			continue;
+		}
+		if (member < 0)
+		{
+			sSYNetPeerPacketsDropped++;
+			continue;
+		}
+		syNetPeerHandleDatagram(buffer, size, member);
 	}
+}
+
+void syNetPeerSendToMember(s32 member, const u8 *buffer, u32 size)
+{
+	port_netsock_sendto(sSYNetPeerSocket, buffer, (s32)size, &sSYNetPeerMembers[member].addr);
+}
+
+/* To everyone in the round: a guest has only the host to talk to, the host
+ * talks to each guest. except = a member to leave out (-1 for none). */
+void syNetPeerSendToRound(const u8 *buffer, u32 size, s32 except)
+{
+	s32 i;
+
+	if (sSYNetPeerIsHub == FALSE)
+	{
+		if ((sSYNetPeerMembers[0].is_used != FALSE) && (except != 0))
+		{
+			syNetPeerSendToMember(0, buffer, size);
+		}
+		return;
+	}
+	for (i = 1; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		if ((i != except) && (sSYNetPeerMembers[i].is_used != FALSE) && (sSYNetPeerMembers[i].is_in_round != FALSE))
+		{
+			syNetPeerSendToMember(i, buffer, size);
+		}
+	}
+}
+
+/* Pings go to every member, in the round or still waiting to get in. */
+void syNetPeerSendToAll(const u8 *buffer, u32 size)
+{
+	s32 i;
+
+	if (sSYNetPeerIsHub == FALSE)
+	{
+		if (sSYNetPeerMembers[0].is_used != FALSE)
+		{
+			syNetPeerSendToMember(0, buffer, size);
+		}
+		return;
+	}
+	for (i = 1; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		if (sSYNetPeerMembers[i].is_used != FALSE)
+		{
+			syNetPeerSendToMember(i, buffer, size);
+		}
+	}
+}
+
+/* Host: every other member of the round has the flag set. */
+sb32 syNetPeerCheckRoundMembers(s32 flag, sb32 players_only)
+{
+	s32 i;
+
+	for (i = 1; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		SYNetPeerMember *m = &sSYNetPeerMembers[i];
+		sb32 value;
+
+		if ((m->is_used == FALSE) || (m->is_in_round == FALSE) || ((players_only != FALSE) && (m->slot < 0)))
+		{
+			continue;
+		}
+		value = (flag == 0) ? m->is_ready : (flag == 1) ? m->is_battle_ready : m->is_battle_start;
+
+		if (value == FALSE)
+		{
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+
+u32 syNetPeerMemberSilentMs(s32 member)
+{
+	return port_netsock_now_ms() - sSYNetPeerMembers[member].last_heard_ms;
 }
 #endif
 
@@ -417,6 +675,16 @@ void syNetPeerMakeBootstrapMetadata(SYNetInputReplayMetadata *metadata)
 		if (metadata->player_count == 0)
 		{
 			metadata->player_count = 2;
+		}
+		/* The lobby's preset (Dream Land, no items; hazards are off through
+		 * port_netplay_set_hazards_off) wins over whatever the VS options
+		 * were set to in the menus. */
+		if (sSYNetPeerRoundFlags & SYNETPEER_ROUND_FLAG_PRESET)
+		{
+			metadata->stage_kind = nGRKindPupupu;
+			metadata->is_stage_select = FALSE;
+			metadata->item_switch = nSCBattleItemSwitchNone;
+			metadata->item_appearance_rate = nSCBattleItemSwitchNone;
 		}
 		return;
 	}
@@ -527,7 +795,20 @@ void syNetPeerApplyBootstrapMetadata(const SYNetInputReplayMetadata *metadata)
 #ifdef PORT
 void syNetPeerSendBytes(const u8 *buffer, u32 size)
 {
-	port_netsock_sendto(sSYNetPeerSocket, buffer, (s32)size, &sSYNetPeerPeerAddress);
+	syNetPeerSendToRound(buffer, size, -1);
+}
+
+void syNetPeerMakeControlPacket(u8 *buffer, u16 packet_type, u32 session_id)
+{
+	u8 *cursor = buffer;
+	u32 checksum;
+
+	syNetPeerWriteU32(&cursor, SYNETPEER_MAGIC);
+	syNetPeerWriteU16(&cursor, SYNETPEER_VERSION);
+	syNetPeerWriteU16(&cursor, packet_type);
+	syNetPeerWriteU32(&cursor, session_id);
+	checksum = syNetPeerChecksumBytes(buffer, cursor - buffer);
+	syNetPeerWriteU32(&cursor, checksum);
 }
 #endif
 
@@ -535,21 +816,15 @@ void syNetPeerSendControlPacket(u16 packet_type)
 {
 #ifdef PORT
 	u8 buffer[SYNETPEER_CONTROL_PACKET_BYTES];
-	u8 *cursor = buffer;
-	u32 checksum;
 
-	syNetPeerWriteU32(&cursor, SYNETPEER_MAGIC);
-	syNetPeerWriteU16(&cursor, SYNETPEER_VERSION);
-	syNetPeerWriteU16(&cursor, packet_type);
-	syNetPeerWriteU32(&cursor, sSYNetPeerSessionID);
-	checksum = syNetPeerChecksumBytes(buffer, cursor - buffer);
-	syNetPeerWriteU32(&cursor, checksum);
+	syNetPeerMakeControlPacket(buffer, packet_type, sSYNetPeerSessionID);
 	syNetPeerSendBytes(buffer, SYNETPEER_CONTROL_PACKET_BYTES);
 #endif
 }
 
 #ifdef PORT
-void syNetPeerSendPingPacket(u16 packet_type, u32 stamp_ms)
+/* to: a member, or -1 = PING to everyone / REMATCH to the round. */
+void syNetPeerSendPingPacketTo(u16 packet_type, u32 stamp_ms, s32 to)
 {
 	u8 buffer[SYNETPEER_PING_PACKET_BYTES];
 	u8 *cursor = buffer;
@@ -562,10 +837,24 @@ void syNetPeerSendPingPacket(u16 packet_type, u32 stamp_ms)
 	syNetPeerWriteU32(&cursor, stamp_ms);
 	checksum = syNetPeerChecksumBytes(buffer, cursor - buffer);
 	syNetPeerWriteU32(&cursor, checksum);
-	syNetPeerSendBytes(buffer, SYNETPEER_PING_PACKET_BYTES);
+
+	if (to >= 0)
+	{
+		syNetPeerSendToMember(to, buffer, SYNETPEER_PING_PACKET_BYTES);
+	}
+	else if (packet_type == SYNETPEER_PACKET_PING)
+	{
+		syNetPeerSendToAll(buffer, SYNETPEER_PING_PACKET_BYTES);
+	}
+	else syNetPeerSendBytes(buffer, SYNETPEER_PING_PACKET_BYTES);
 }
 
-void syNetPeerHandlePingPacket(const u8 *buffer, s32 size)
+void syNetPeerSendPingPacket(u16 packet_type, u32 stamp_ms)
+{
+	syNetPeerSendPingPacketTo(packet_type, stamp_ms, -1);
+}
+
+void syNetPeerHandlePingPacket(const u8 *buffer, s32 size, s32 member)
 {
 	const u8 *cursor = buffer;
 	u32 magic;
@@ -586,7 +875,9 @@ void syNetPeerHandlePingPacket(const u8 *buffer, s32 size)
 	stamp_ms = syNetPeerReadU32(&cursor);
 	checksum = syNetPeerReadU32(&cursor);
 
-	if ((magic != SYNETPEER_MAGIC) || (version != SYNETPEER_VERSION) || (session_id != sSYNetPeerSessionID) ||
+	/* PING/PONG carry no state: answer them whatever phase either side is
+	 * in (a member waiting for the next round has no session id yet). */
+	if ((magic != SYNETPEER_MAGIC) || (version != SYNETPEER_VERSION) ||
 	    (checksum != syNetPeerChecksumBytes(buffer, SYNETPEER_PING_PACKET_BYTES - 4)))
 	{
 		sSYNetPeerPacketsDropped++;
@@ -594,14 +885,19 @@ void syNetPeerHandlePingPacket(const u8 *buffer, s32 size)
 	}
 	if (packet_type == SYNETPEER_PACKET_PING)
 	{
-		syNetPeerSendPingPacket(SYNETPEER_PACKET_PONG, stamp_ms);
+		syNetPeerSendPingPacketTo(SYNETPEER_PACKET_PONG, stamp_ms, member);
 	}
 	else if (packet_type == SYNETPEER_PACKET_PONG)
 	{
 		u32 rtt = port_netsock_now_ms() - stamp_ms;
+		SYNetPeerMember *m = &sSYNetPeerMembers[member];
 
 		/* Smooth a little; a single late packet should not bounce the HUD. */
-		sSYNetPeerPingMs = (sSYNetPeerPingMs == 0) ? rtt : (sSYNetPeerPingMs * 3 + rtt) / 4;
+		m->ping_ms = (m->ping_ms == 0) ? rtt : (m->ping_ms * 3 + rtt) / 4;
+	}
+	else if (session_id != sSYNetPeerSessionID)
+	{
+		sSYNetPeerPacketsDropped++;
 	}
 	else if (packet_type == SYNETPEER_PACKET_REMATCH)
 	{
@@ -628,7 +924,12 @@ void syNetPeerSendMatchConfigPacket(void)
 	syNetPeerSendBytes(buffer, SYNETPEER_BOOTSTRAP_PACKET_BYTES);
 }
 
-void syNetPeerHandleControlPacket(const u8 *buffer, s32 size)
+#ifdef PORT
+void syNetPeerHostDropMember(s32 member, const char *reason);
+void syNetPeerGuestHostGone(const char *reason);
+#endif
+
+void syNetPeerHandleControlPacket(const u8 *buffer, s32 size, s32 member)
 {
 	const u8 *cursor = buffer;
 	u32 magic;
@@ -650,14 +951,41 @@ void syNetPeerHandleControlPacket(const u8 *buffer, s32 size)
 	session_id = syNetPeerReadU32(&cursor);
 	checksum = syNetPeerReadU32(&cursor);
 
-	if ((magic != SYNETPEER_MAGIC) || (version != SYNETPEER_VERSION) ||
-		(session_id != sSYNetPeerSessionID) || (checksum != expected_checksum))
+	if ((magic != SYNETPEER_MAGIC) || (version != SYNETPEER_VERSION) || (checksum != expected_checksum))
+	{
+		sSYNetPeerPacketsDropped++;
+		return;
+	}
+#ifdef PORT
+	if (packet_type == SYNETPEER_PACKET_BYE)
+	{
+		if (sSYNetPeerIsHub != FALSE)
+		{
+			syNetPeerHostDropMember(member, "left");
+		}
+		else syNetPeerGuestHostGone("the host left");
+
+		return;
+	}
+	if (packet_type == SYNETPEER_PACKET_ROUND_START)
+	{
+		if ((sSYNetPeerIsHub == FALSE) && (sSYNetPeerRoundState == 1) && (session_id == sSYNetPeerRound.session_id))
+		{
+			sSYNetPeerRoundApplyPending = TRUE;
+		}
+		return;
+	}
+#endif
+	if (session_id != sSYNetPeerSessionID)
 	{
 		sSYNetPeerPacketsDropped++;
 		return;
 	}
 	if (packet_type == SYNETPEER_PACKET_READY)
 	{
+#ifdef PORT
+		sSYNetPeerMembers[member].is_ready = TRUE;
+#endif
 		sSYNetPeerBootstrapPeerReady = TRUE;
 	}
 	else if (packet_type == SYNETPEER_PACKET_START)
@@ -666,21 +994,27 @@ void syNetPeerHandleControlPacket(const u8 *buffer, s32 size)
 	}
 	else if (packet_type == SYNETPEER_PACKET_BATTLE_READY)
 	{
+#ifdef PORT
+		sSYNetPeerMembers[member].is_battle_ready = TRUE;
+#endif
 		if (sSYNetPeerBattlePeerReady == FALSE)
 		{
-			port_log("SSB64 NetPeer: received BATTLE_READY role=%s tick=%u local=%d remote=%d\n",
+			port_log("SSB64 NetPeer: received BATTLE_READY role=%s tick=%u local=%d member=%d\n",
 			         (sSYNetPeerBootstrapIsHost != FALSE) ? "host" : "client",
-			         syNetInputGetTick(), sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer);
+			         syNetInputGetTick(), sSYNetPeerLocalPlayer, member);
 		}
 		sSYNetPeerBattlePeerReady = TRUE;
 	}
 	else if (packet_type == SYNETPEER_PACKET_BATTLE_START)
 	{
+#ifdef PORT
+		sSYNetPeerMembers[member].is_battle_start = TRUE;
+#endif
 		if (sSYNetPeerBattleStartReceived == FALSE)
 		{
-			port_log("SSB64 NetPeer: received BATTLE_START role=%s tick=%u local=%d remote=%d\n",
+			port_log("SSB64 NetPeer: received BATTLE_START role=%s tick=%u local=%d member=%d\n",
 			         (sSYNetPeerBootstrapIsHost != FALSE) ? "host" : "client",
-			         syNetInputGetTick(), sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer);
+			         syNetInputGetTick(), sSYNetPeerLocalPlayer, member);
 		}
 		sSYNetPeerBattleStartReceived = TRUE;
 	}
@@ -741,12 +1075,162 @@ void syNetPeerHandleMatchConfigPacket(const u8 *buffer, s32 size)
 	}
 }
 
-void syNetPeerHandleBootstrapPacket(const u8 *buffer, s32 size)
+#ifdef PORT
+/* ---- ROUND_CONFIG ---- one per member (it names who you are). */
+void syNetPeerSendRoundConfigTo(s32 member)
+{
+	u8 buffer[SYNETPEER_ROUND_PACKET_BYTES];
+	u8 *cursor = buffer;
+	SYNetPeerRound *r = &sSYNetPeerRound;
+	u32 checksum;
+	s32 i;
+	s32 c;
+
+	syNetPeerWriteU32(&cursor, SYNETPEER_MAGIC);
+	syNetPeerWriteU16(&cursor, SYNETPEER_VERSION);
+	syNetPeerWriteU16(&cursor, SYNETPEER_PACKET_ROUND_CONFIG);
+	syNetPeerWriteU32(&cursor, r->session_id);
+	syNetPeerWriteU32(&cursor, r->session_base);
+	syNetPeerWriteU32(&cursor, r->session_phase);
+	syNetPeerWriteU8(&cursor, (u8)member);
+	syNetPeerWriteU8(&cursor, r->mode);
+	syNetPeerWriteU8(&cursor, r->flags);
+	syNetPeerWriteU8(&cursor, r->scene);
+	syNetPeerWriteU8(&cursor, r->scene_prev);
+	syNetPeerWriteU32(&cursor, r->seed);
+
+	for (i = 0; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		syNetPeerWriteU8(&cursor, r->used[i]);
+		syNetPeerWriteU8(&cursor, r->in_round[i]);
+		syNetPeerWriteU8(&cursor, r->slot[i]);
+		syNetPeerWriteU8(&cursor, r->queue_pos[i]);
+
+		for (c = 0; c < SYNETPEER_CODE_BYTES; c++)
+		{
+			syNetPeerWriteU8(&cursor, (u8)r->code[i][c]);
+		}
+	}
+	syNetPeerWriteMetadata(&cursor, &r->metadata);
+	syNetPeerWriteU32(&cursor, r->unlock_mask);
+	syNetPeerWriteU32(&cursor, r->fighter_mask);
+	checksum = syNetPeerChecksumBytes(buffer, cursor - buffer);
+	syNetPeerWriteU32(&cursor, checksum);
+	syNetPeerSendToMember(member, buffer, SYNETPEER_ROUND_PACKET_BYTES);
+}
+
+void syNetPeerSendRoundReady(u32 session_id)
+{
+	u8 buffer[SYNETPEER_CONTROL_PACKET_BYTES];
+
+	syNetPeerMakeControlPacket(buffer, SYNETPEER_PACKET_READY, session_id);
+	syNetPeerSendToMember(0, buffer, SYNETPEER_CONTROL_PACKET_BYTES);
+}
+
+/* Guest. A newer round than anything we have: keep it and say READY (again
+ * for every copy, in case the last READY was lost). ROUND_START applies it. */
+void syNetPeerHandleRoundConfigPacket(const u8 *buffer, s32 size, s32 member)
+{
+	const u8 *cursor = buffer;
+	SYNetPeerRound r;
+	u32 magic;
+	u16 version;
+	u16 packet_type;
+	u32 checksum;
+	s32 i;
+	s32 c;
+
+	if ((sSYNetPeerIsHub != FALSE) || (member != 0))
+	{
+		return;
+	}
+	magic = syNetPeerReadU32(&cursor);
+	version = syNetPeerReadU16(&cursor);
+	packet_type = syNetPeerReadU16(&cursor);
+	r.session_id = syNetPeerReadU32(&cursor);
+	r.session_base = syNetPeerReadU32(&cursor);
+	r.session_phase = syNetPeerReadU32(&cursor);
+	r.your_member = syNetPeerReadU8(&cursor);
+	r.mode = syNetPeerReadU8(&cursor);
+	r.flags = syNetPeerReadU8(&cursor);
+	r.scene = syNetPeerReadU8(&cursor);
+	r.scene_prev = syNetPeerReadU8(&cursor);
+	r.seed = syNetPeerReadU32(&cursor);
+
+	for (i = 0; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		r.used[i] = syNetPeerReadU8(&cursor);
+		r.in_round[i] = syNetPeerReadU8(&cursor);
+		r.slot[i] = syNetPeerReadU8(&cursor);
+		r.queue_pos[i] = syNetPeerReadU8(&cursor);
+
+		for (c = 0; c < SYNETPEER_CODE_BYTES; c++)
+		{
+			r.code[i][c] = (char)syNetPeerReadU8(&cursor);
+		}
+		r.code[i][SYNETPEER_CODE_BYTES - 1] = '\0';
+	}
+	syNetPeerReadMetadata(&cursor, &r.metadata);
+	r.unlock_mask = syNetPeerReadU32(&cursor);
+	r.fighter_mask = syNetPeerReadU32(&cursor);
+	checksum = syNetPeerReadU32(&cursor);
+
+	if ((magic != SYNETPEER_MAGIC) || (version != SYNETPEER_VERSION) ||
+	    (packet_type != SYNETPEER_PACKET_ROUND_CONFIG) || (r.your_member == 0) ||
+	    (r.your_member >= SYNETPEER_MAX_MEMBERS) || (syNetPeerCheckMetadata(&r.metadata) == FALSE) ||
+	    (checksum != syNetPeerChecksumBytes(buffer, SYNETPEER_ROUND_PACKET_BYTES - 4)))
+	{
+		sSYNetPeerPacketsDropped++;
+		return;
+	}
+	if ((sSYNetPeerRoundState == 1) && (r.session_id == sSYNetPeerRound.session_id))
+	{
+		syNetPeerSendRoundReady(r.session_id);
+		return;
+	}
+	/* Older than the round we are in (or hold): a stale copy. */
+	if ((r.session_id <= sSYNetPeerSessionID) && (sSYNetPeerRoundsApplied != 0))
+	{
+		return;
+	}
+	if ((sSYNetPeerRoundState == 1) && (r.session_id < sSYNetPeerRound.session_id))
+	{
+		return;
+	}
+	sSYNetPeerRound = r;
+	sSYNetPeerRoundState = 1;
+	sSYNetPeerRoundApplyPending = FALSE;
+	port_log("SSB64 NetPeer: round config session=%u member=%u slot=%d scene=%u mode=%u flags=%u\n", r.session_id,
+	         r.your_member, (r.slot[r.your_member] == SYNETPEER_SLOT_NONE) ? -1 : (s32)r.slot[r.your_member], r.scene,
+	         r.mode, r.flags);
+	syNetPeerSendRoundReady(r.session_id);
+}
+
+void syNetPeerHandleInputPacket(const u8 *buffer, s32 size, s32 member);
+#endif
+
+/* Every datagram from a member, whatever phase we are in; each kind checks
+ * its own session id. */
+void syNetPeerHandleDatagram(const u8 *buffer, s32 size, s32 member)
 {
 	if (size == SYNETPEER_CONTROL_PACKET_BYTES)
 	{
-		syNetPeerHandleControlPacket(buffer, size);
+		syNetPeerHandleControlPacket(buffer, size, member);
 	}
+#ifdef PORT
+	else if (size == SYNETPEER_PING_PACKET_BYTES)
+	{
+		syNetPeerHandlePingPacket(buffer, size, member);
+	}
+	else if (size == SYNETPEER_PACKET_BYTES)
+	{
+		syNetPeerHandleInputPacket(buffer, size, member);
+	}
+	else if (size == SYNETPEER_ROUND_PACKET_BYTES)
+	{
+		syNetPeerHandleRoundConfigPacket(buffer, size, member);
+	}
+#endif
 	else if (size == SYNETPEER_BOOTSTRAP_PACKET_BYTES)
 	{
 		syNetPeerHandleMatchConfigPacket(buffer, size);
@@ -756,9 +1240,19 @@ void syNetPeerHandleBootstrapPacket(const u8 *buffer, s32 size)
 
 void syNetPeerReceiveBootstrapPackets(void)
 {
-	u8 buffer[SYNETPEER_BOOTSTRAP_PACKET_BYTES];
+#ifdef PORT
+	syNetPeerReceiveAll();
+#endif
+}
 
-	syNetPeerReceiveAll(syNetPeerHandleBootstrapPacket, buffer, sizeof(buffer));
+/* Host: all of the round's guests have answered READY. */
+sb32 syNetPeerCheckBootstrapPeersReady(void)
+{
+#ifdef PORT
+	return syNetPeerCheckRoundMembers(0, FALSE);
+#else
+	return sSYNetPeerBootstrapPeerReady;
+#endif
 }
 
 /* Blocking exchange of the match config. TRUE once both sides hold it (host:
@@ -787,13 +1281,13 @@ sb32 syNetPeerRunBootstrap(void)
 			syNetPeerSendMatchConfigPacket();
 			syNetPeerReceiveBootstrapPackets();
 
-			if (sSYNetPeerBootstrapPeerReady != FALSE)
+			if (syNetPeerCheckBootstrapPeersReady() != FALSE)
 			{
 				break;
 			}
 			syNetPeerSleepBootstrapRetry();
 		}
-		if (sSYNetPeerBootstrapPeerReady == FALSE)
+		if (syNetPeerCheckBootstrapPeersReady() == FALSE)
 		{
 			port_log("SSB64 NetPeer: bootstrap host timed out waiting for READY\n");
 			return FALSE;
@@ -817,6 +1311,13 @@ sb32 syNetPeerRunBootstrap(void)
 				syNetPeerSendControlPacket(SYNETPEER_PACKET_READY);
 				break;
 			}
+#ifdef PORT
+			/* The host gave up on this battle and started a new round. */
+			if (sSYNetPeerRoundApplyPending != FALSE)
+			{
+				return FALSE;
+			}
+#endif
 			syNetPeerSleepBootstrapRetry();
 		}
 		if (sSYNetPeerBootstrapMetadataApplied == FALSE)
@@ -833,6 +1334,12 @@ sb32 syNetPeerRunBootstrap(void)
 			{
 				break;
 			}
+#ifdef PORT
+			if (sSYNetPeerRoundApplyPending != FALSE)
+			{
+				return FALSE;
+			}
+#endif
 			syNetPeerSleepBootstrapRetry();
 		}
 		if (sSYNetPeerBootstrapStartReceived == FALSE)
@@ -848,9 +1355,10 @@ sb32 syNetPeerRunBootstrap(void)
 
 /* A new tick space: the next menu phase or the next battle of an in-menu
  * session. Both sides call this at the same point of the same flow. */
-void syNetPeerBeginPhase(void)
+void syNetPeerResetPhaseState(void)
 {
-	sSYNetPeerSessionPhase++;
+	s32 i;
+
 	sSYNetPeerSessionID = sSYNetPeerSessionBase + sSYNetPeerSessionPhase;
 	sSYNetPeerBootstrapMetadataApplied = FALSE;
 	sSYNetPeerBootstrapPeerReady = FALSE;
@@ -861,6 +1369,77 @@ void syNetPeerBeginPhase(void)
 	sSYNetPeerRemoteAdvantageValid = FALSE;
 	sSYNetPeerSendSeq = 0;
 	sSYNetPeerPingFrames = 0;
+
+	for (i = 0; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		sSYNetPeerMembers[i].is_ready = FALSE;
+		sSYNetPeerMembers[i].is_battle_ready = FALSE;
+		sSYNetPeerMembers[i].is_battle_start = FALSE;
+	}
+	for (i = 0; i < MAXCONTROLLERS; i++)
+	{
+		sSYNetPeerSlotHighestTick[i] = 0;
+		sSYNetPeerSlotHasTick[i] = FALSE;
+		sSYNetPeerSlotAdvantageValid[i] = FALSE;
+	}
+}
+
+void syNetPeerBeginPhase(void)
+{
+	sSYNetPeerSessionPhase++;
+	syNetPeerResetPhaseState();
+}
+
+/* Frames of this session that arrived while we were still in the last one
+ * go in now, after the phase's netinput reset. */
+void syNetPeerApplyEarlyFrames(void)
+{
+	s32 slot;
+	s32 i;
+
+	if (sSYNetPeerEarlySession != sSYNetPeerSessionID)
+	{
+		return;
+	}
+	for (slot = 0; slot < MAXCONTROLLERS; slot++)
+	{
+		for (i = 0; i < SYNETPEER_EARLY_FRAMES; i++)
+		{
+			SYNetPeerPacketFrame *f = &sSYNetPeerEarlyFrames[slot][i];
+
+			if ((sSYNetPeerEarlyValid[slot][i] == FALSE) || !(sSYNetPeerRemoteMask & (1 << slot)))
+			{
+				continue;
+			}
+			syNetInputSetRemoteInput(slot, f->tick, f->buttons, f->stick_x, f->stick_y);
+
+			if ((sSYNetPeerSlotHasTick[slot] == FALSE) || (f->tick > sSYNetPeerSlotHighestTick[slot]))
+			{
+				sSYNetPeerSlotHighestTick[slot] = f->tick;
+				sSYNetPeerSlotHasTick[slot] = TRUE;
+			}
+		}
+	}
+	sSYNetPeerEarlySession = 0;
+	memset(sSYNetPeerEarlyValid, 0, sizeof(sSYNetPeerEarlyValid));
+}
+
+void syNetPeerStashEarlyFrames(u32 session_id, s32 slot, const SYNetPeerPacketFrame *frames, s32 frame_count)
+{
+	s32 i;
+
+	if (sSYNetPeerEarlySession != session_id)
+	{
+		memset(sSYNetPeerEarlyValid, 0, sizeof(sSYNetPeerEarlyValid));
+		sSYNetPeerEarlySession = session_id;
+	}
+	for (i = 0; i < frame_count; i++)
+	{
+		u32 index = frames[i].tick % SYNETPEER_EARLY_FRAMES;
+
+		sSYNetPeerEarlyFrames[slot][index] = frames[i];
+		sSYNetPeerEarlyValid[slot][index] = TRUE;
+	}
 }
 
 sb32 syNetPeerCheckMenuMode(void)
@@ -885,6 +1464,8 @@ void syNetPeerSendPeriodicPing(void)
  * the environment-driven debug path and the lobby path. */
 void syNetPeerResetConfig(void)
 {
+	s32 i;
+
 	sSYNetPeerIsEnabled = FALSE;
 	sSYNetPeerIsConfigured = FALSE;
 	sSYNetPeerLocalPlayer = 0;
@@ -918,6 +1499,36 @@ void syNetPeerResetConfig(void)
 	sSYNetPeerSessionPhase = 0;
 	syNetMenuStop();
 
+	memset(sSYNetPeerMembers, 0, sizeof(sSYNetPeerMembers));
+
+	for (i = 0; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		sSYNetPeerMembers[i].slot = -1;
+		sSYNetPeerMembers[i].queue_pos = -1;
+	}
+	for (i = 0; i < MAXCONTROLLERS; i++)
+	{
+		sSYNetPeerSlotOwner[i] = -1;
+	}
+	sSYNetPeerMyMember = 0;
+	sSYNetPeerIsHub = FALSE;
+	sSYNetPeerRemoteMask = 0;
+	sSYNetPeerBattleRunning = FALSE;
+	sSYNetPeerGroupMode = SYNETPEER_MODE_ROTATION;
+	sSYNetPeerRoundFlags = 0;
+	sSYNetPeerRotValid = FALSE;
+	sSYNetPeerRotKing = -1;
+	sSYNetPeerQueueCount = 0;
+	sSYNetPeerRoundState = 0;
+	sSYNetPeerRoundApplyPending = FALSE;
+	sSYNetPeerRoundAwaiting = FALSE;
+	sSYNetPeerRoundFailed = FALSE;
+	sSYNetPeerRoundsApplied = 0;
+	sSYNetPeerRoundStartRepeat = 0;
+	sSYNetPeerEarlySession = 0;
+	memset(sSYNetPeerEarlyValid, 0, sizeof(sSYNetPeerEarlyValid));
+	port_netplay_set_hazards_off(-1);
+
 	if (sSYNetPeerMasksOverridden != FALSE)
 	{
 		gSCManagerBackupData.unlock_mask = sSYNetPeerSavedUnlockMask;
@@ -926,26 +1537,106 @@ void syNetPeerResetConfig(void)
 	}
 }
 
+void syNetPeerCopyCode(char *dst, const char *src)
+{
+	s32 i;
+
+	for (i = 0; (i < SYNETPEER_CODE_BYTES - 1) && (src != NULL) && (src[i] != '\0'); i++)
+	{
+		dst[i] = src[i];
+	}
+	for (; i < SYNETPEER_CODE_BYTES; i++)
+	{
+		dst[i] = '\0';
+	}
+}
+
+/* My slot and everyone else's from the member table. */
+void syNetPeerApplySlots(void)
+{
+	s32 i;
+
+	sSYNetPeerRemoteMask = 0;
+	sSYNetPeerRemotePlayer = -1;
+
+	for (i = 0; i < MAXCONTROLLERS; i++)
+	{
+		sSYNetPeerSlotOwner[i] = -1;
+	}
+	for (i = 0; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		SYNetPeerMember *m = &sSYNetPeerMembers[i];
+
+		if ((m->is_used == FALSE) || (m->is_in_round == FALSE) || (m->slot < 0) || (m->slot >= MAXCONTROLLERS))
+		{
+			continue;
+		}
+		sSYNetPeerSlotOwner[m->slot] = i;
+
+		if (i != sSYNetPeerMyMember)
+		{
+			sSYNetPeerRemoteMask |= 1 << m->slot;
+
+			if ((sSYNetPeerRemotePlayer < 0) || (m->slot < sSYNetPeerRemotePlayer))
+			{
+				sSYNetPeerRemotePlayer = m->slot;
+			}
+		}
+	}
+	sSYNetPeerLocalPlayer = sSYNetPeerMembers[sSYNetPeerMyMember].is_in_round ? sSYNetPeerMembers[sSYNetPeerMyMember].slot : -1;
+}
+
+/* Two people and nobody else: the environment-driven debug path and the
+ * Netplay page's quick match. Host = member 0. */
+void syNetPeerSetupPair(const PortNetAddr *peer, sb32 is_host, s32 local_player, s32 remote_player)
+{
+	s32 me = (is_host != FALSE) ? 0 : 1;
+	s32 them = 1 - me;
+
+	sSYNetPeerIsHub = is_host;
+	sSYNetPeerMyMember = me;
+	sSYNetPeerMembers[0].is_used = TRUE;
+	sSYNetPeerMembers[1].is_used = TRUE;
+	sSYNetPeerMembers[0].is_in_round = TRUE;
+	sSYNetPeerMembers[1].is_in_round = TRUE;
+	sSYNetPeerMembers[me].slot = local_player;
+	sSYNetPeerMembers[them].slot = remote_player;
+	sSYNetPeerMembers[them].addr = *peer;
+	sSYNetPeerMembers[them].last_heard_ms = port_netsock_now_ms();
+	sSYNetPeerPeerAddress = *peer;
+	syNetPeerApplySlots();
+}
+
 /* ---- Lobby-driven sessions (port/netplay/lobby.cpp) ----
  * The lobby has already punched a hole to the peer on `sock`. It hands the
  * socket and the match parameters over here, then calls syNetPeerLobbyStep()
- * once per frame until it reports done, and only then moves the game into
- * nSCKindVSBattle. This is the per-frame form of syNetPeerRunBootstrap's
- * blocking loop; the packets are the same. Host = player 0, client = 1.
+ * once per frame until it reports done. Host = player 0, client = 1.
  *
- * With menu_mode the picks are ignored: the config exchanged carries the
- * host's VS rules, and once it is through both players are dropped into the
- * VS menu in lockstep (sys/netmenu.c) to pick everything there. */
+ * With menu_mode this is a group session of two (see syNetPeerHostConfigure):
+ * the picks are ignored and both are dropped into the VS menu in lockstep
+ * (sys/netmenu.c) to pick everything there. Without, it is the quick match:
+ * MATCH_CONFIG with the picks, then straight into the battle. */
 void syNetPeerLobbyConfigure(intptr_t sock, const PortNetAddr *peer, sb32 is_host, u32 delay, u32 session_id,
                              u32 seed, u8 host_fighter, u8 client_fighter, u32 stage_kind, u32 stocks,
                              u32 time_minutes, sb32 menu_mode)
 {
+	if (menu_mode != FALSE)
+	{
+		if (is_host != FALSE)
+		{
+			syNetPeerHostConfigure(sock, delay, session_id, seed);
+			syNetPeerHostAddMember(peer, "");
+			syNetPeerHostStartSession();
+		}
+		else syNetPeerGuestConfigure(sock, peer, delay, session_id);
+
+		return;
+	}
 	if (sSYNetPeerSocket != sock)
 	{
 		syNetPeerCloseSocket();
 	}
 	syNetPeerResetConfig();
-	sSYNetPeerMenuMode = menu_mode;
 	sSYNetPeerSessionBase = (session_id != 0) ? session_id : SYNETPEER_DEFAULT_SESSION_ID;
 	sSYNetPeerSessionPhase = 0;
 	sSYNetPeerLobbySession = TRUE;
@@ -956,19 +1647,17 @@ void syNetPeerLobbyConfigure(intptr_t sock, const PortNetAddr *peer, sb32 is_hos
 
 	sSYNetPeerIsEnabled = TRUE;
 	sSYNetPeerIsConfigured = TRUE;
-	sSYNetPeerLocalPlayer = (is_host != FALSE) ? 0 : 1;
-	sSYNetPeerRemotePlayer = (is_host != FALSE) ? 1 : 0;
+	syNetPeerSetupPair(peer, is_host, (is_host != FALSE) ? 0 : 1, (is_host != FALSE) ? 1 : 0);
 	sSYNetPeerInputDelay = delay;
 	sSYNetPeerSessionID = (session_id != 0) ? session_id : SYNETPEER_DEFAULT_SESSION_ID;
 	sSYNetPeerBootstrapIsEnabled = TRUE;
 	sSYNetPeerBootstrapIsHost = is_host;
 	sSYNetPeerBootstrapSeed = (seed != 0) ? seed : SYNETPEER_DEFAULT_BOOTSTRAP_SEED;
-	sSYNetPeerLobbyHasPicks = (menu_mode == FALSE) ? TRUE : FALSE;
+	sSYNetPeerLobbyHasPicks = TRUE;
 	sSYNetPeerLobbyFighters[0] = host_fighter;
 	sSYNetPeerLobbyFighters[1] = client_fighter;
 	sSYNetPeerLobbyStageKind = stage_kind;
 	sSYNetPeerSocket = sock;
-	sSYNetPeerPeerAddress = *peer;
 	sSYNetPeerIsActive = TRUE;
 	sSYNetPeerLobbyActive = TRUE;
 	/* Predictions are only ever corrected by rollback. */
@@ -982,15 +1671,620 @@ void syNetPeerLobbyConfigure(intptr_t sock, const PortNetAddr *peer, sb32 is_hos
 		syNetPeerMakeBootstrapMetadata(&sSYNetPeerBootstrapMetadata);
 		syNetPeerApplyBootstrapMetadata(&sSYNetPeerBootstrapMetadata);
 	}
-	port_log("SSB64 NetPeer: lobby session role=%s delay=%u session=%u seed=%u menus=%d fighters=%u/%u stage=%u stocks=%u time=%u\n",
-	         (is_host != FALSE) ? "host" : "client", delay, sSYNetPeerSessionID, sSYNetPeerBootstrapSeed, menu_mode,
+	port_log("SSB64 NetPeer: quick match role=%s delay=%u session=%u seed=%u fighters=%u/%u stage=%u stocks=%u time=%u\n",
+	         (is_host != FALSE) ? "host" : "client", delay, sSYNetPeerSessionID, sSYNetPeerBootstrapSeed,
 	         host_fighter, client_fighter, stage_kind, stocks, time_minutes);
 }
 
-/* 1 = match config exchanged (enter the battle), 0 = still going, -1 = gave
- * up (10 s without the peer's answer). */
+/* Shared by both ends of a group session. */
+void syNetPeerConfigureGroup(intptr_t sock, sb32 is_host, u32 delay, u32 session_id, u32 seed)
+{
+	if (sSYNetPeerSocket != sock)
+	{
+		syNetPeerCloseSocket();
+	}
+	syNetPeerResetConfig();
+	sSYNetPeerSocket = sock;
+	sSYNetPeerMenuMode = TRUE;
+	sSYNetPeerSessionBase = (session_id != 0) ? session_id : SYNETPEER_DEFAULT_SESSION_ID;
+	sSYNetPeerSessionPhase = 0;
+	sSYNetPeerSessionID = sSYNetPeerSessionBase;
+	sSYNetPeerLobbySession = TRUE;
+	sSYNetPeerLobbyDelay = delay;
+	sSYNetPeerIsEnabled = TRUE;
+	sSYNetPeerIsConfigured = TRUE;
+	sSYNetPeerInputDelay = delay;
+	sSYNetPeerBootstrapIsEnabled = TRUE;
+	sSYNetPeerBootstrapIsHost = is_host;
+	sSYNetPeerIsHub = is_host;
+	sSYNetPeerBootstrapSeed = (seed != 0) ? seed : SYNETPEER_DEFAULT_BOOTSTRAP_SEED;
+	sSYNetPeerLobbyActive = TRUE;
+	sSYNetPeerLobbyFrames = 0;
+	sSYNetPeerLastPingMs = port_netsock_now_ms();
+	syNetStateSetEnabled(TRUE);
+}
+
+/* Host of a group session: the lobby collected the guests on `sock`
+ * (syNetPeerHostAddMember for each, now or later), and the host's Start
+ * calls syNetPeerHostStartSession. */
+void syNetPeerHostConfigure(intptr_t sock, u32 delay, u32 session_id, u32 seed)
+{
+	syNetPeerConfigureGroup(sock, TRUE, delay, session_id, seed);
+	sSYNetPeerMyMember = 0;
+	sSYNetPeerMembers[0].is_used = TRUE;
+	syNetPeerCopyCode(sSYNetPeerMembers[0].code, port_lobby_code());
+	port_log("SSB64 NetPeer: hosting a group session delay=%u session=%u seed=%u\n", delay, sSYNetPeerSessionBase,
+	         sSYNetPeerBootstrapSeed);
+}
+
+/* Someone reached the host (before or after Start). Returns their member
+ * number, -1 if the session is full. They join at the next round. */
+s32 syNetPeerHostAddMember(const PortNetAddr *addr, const char *code)
+{
+	s32 i;
+
+	if (sSYNetPeerIsHub == FALSE)
+	{
+		return -1;
+	}
+	i = syNetPeerFindMember(addr);
+
+	if (i >= 0)
+	{
+		if ((code != NULL) && (code[0] != '\0'))
+		{
+			syNetPeerCopyCode(sSYNetPeerMembers[i].code, code);
+		}
+		return i;
+	}
+	for (i = 1; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		if (sSYNetPeerMembers[i].is_used == FALSE)
+		{
+			memset(&sSYNetPeerMembers[i], 0, sizeof(sSYNetPeerMembers[i]));
+			sSYNetPeerMembers[i].is_used = TRUE;
+			sSYNetPeerMembers[i].addr = *addr;
+			sSYNetPeerMembers[i].slot = -1;
+			sSYNetPeerMembers[i].queue_pos = -1;
+			sSYNetPeerMembers[i].last_heard_ms = port_netsock_now_ms();
+			syNetPeerCopyCode(sSYNetPeerMembers[i].code, code);
+			port_log("SSB64 NetPeer: member %d joined (%s)\n", i, sSYNetPeerMembers[i].code);
+			return i;
+		}
+	}
+	return -1;
+}
+
+void syNetPeerHostStartSession(void)
+{
+	char *minutes_env = getenv("SSB64_NETPLAY_TEST_MINUTES");
+
+	if ((sSYNetPeerIsHub == FALSE) || (sSYNetPeerRoundsApplied != 0) || (sSYNetPeerRoundState != 0))
+	{
+		return;
+	}
+	/* Headless tests: short timed matches without touching the VS options. */
+	if ((minutes_env != NULL) && (atoi(minutes_env) > 0))
+	{
+		gSCManagerTransferBattleState.game_rules = SCBATTLE_GAMERULE_TIME;
+		gSCManagerTransferBattleState.time_limit = atoi(minutes_env);
+	}
+	syNetPeerHostStartRound(FALSE, nSCKindVSMode, nSCKindModeSelect);
+}
+
+/* Guest of a group session: the lobby reached the host on `sock`. From
+ * here we wait for the host's first round. */
+void syNetPeerGuestConfigure(intptr_t sock, const PortNetAddr *host, u32 delay, u32 session_id)
+{
+	syNetPeerConfigureGroup(sock, FALSE, delay, session_id, 0);
+	sSYNetPeerMyMember = -1;
+	sSYNetPeerMembers[0].is_used = TRUE;
+	sSYNetPeerMembers[0].addr = *host;
+	sSYNetPeerMembers[0].last_heard_ms = port_netsock_now_ms();
+	sSYNetPeerPeerAddress = *host;
+	sSYNetPeerLocalPlayer = -1;
+	sSYNetPeerRoundAwaiting = TRUE;
+	port_log("SSB64 NetPeer: joined a group session, waiting for the host to start\n");
+}
+
+/* ---- Rounds ---- */
+
+s32 syNetPeerCountUsedMembers(void)
+{
+	s32 count = 0;
+	s32 i;
+
+	for (i = 0; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		if (sSYNetPeerMembers[i].is_used != FALSE)
+		{
+			count++;
+		}
+	}
+	return count;
+}
+
+void syNetPeerQueueRemove(s32 member)
+{
+	s32 i;
+	s32 j = 0;
+
+	for (i = 0; i < sSYNetPeerQueueCount; i++)
+	{
+		if (sSYNetPeerQueue[i] != member)
+		{
+			sSYNetPeerQueue[j++] = sSYNetPeerQueue[i];
+		}
+	}
+	sSYNetPeerQueueCount = j;
+}
+
+void syNetPeerQueuePush(s32 member)
+{
+	syNetPeerQueueRemove(member);
+	sSYNetPeerQueue[sSYNetPeerQueueCount++] = member;
+}
+
+s32 syNetPeerQueuePop(void)
+{
+	s32 member;
+	s32 i;
+
+	if (sSYNetPeerQueueCount == 0)
+	{
+		return -1;
+	}
+	member = sSYNetPeerQueue[0];
+
+	for (i = 1; i < sSYNetPeerQueueCount; i++)
+	{
+		sSYNetPeerQueue[i - 1] = sSYNetPeerQueue[i];
+	}
+	sSYNetPeerQueueCount--;
+
+	return member;
+}
+
+/* The slot (0 or 1) that won the 1v1 that just ended, from the results
+ * screen's places; -1 when it cannot tell (both placed first: the one who
+ * was already on stays). */
+s32 syNetPeerGetWinnerSlot(void)
+{
+	s32 p0 = portMNVSResultsGetPlace(0);
+	s32 p1 = portMNVSResultsGetPlace(1);
+
+	if ((p0 < 0) || (p1 < 0) || (p0 == p1))
+	{
+		return -1;
+	}
+	return (p0 < p1) ? 0 : 1;
+}
+
+/* Host: who plays and who watches in the next round. */
+void syNetPeerHostBuildRoster(sb32 after_match)
+{
+	s32 mode = port_lobby_group_mode();
+	s32 i;
+
+	if ((mode != SYNETPEER_MODE_ROTATION) && (mode != SYNETPEER_MODE_EVERYONE))
+	{
+		mode = SYNETPEER_MODE_ROTATION;
+	}
+	for (i = 0; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		sSYNetPeerMembers[i].slot = -1;
+		sSYNetPeerMembers[i].queue_pos = -1;
+		sSYNetPeerMembers[i].is_in_round = sSYNetPeerMembers[i].is_used;
+	}
+	if (mode == SYNETPEER_MODE_EVERYONE)
+	{
+		s32 slot = 0;
+
+		for (i = 0; i < SYNETPEER_MAX_MEMBERS; i++)
+		{
+			if (sSYNetPeerMembers[i].is_used != FALSE)
+			{
+				sSYNetPeerMembers[i].slot = slot++;
+			}
+		}
+		sSYNetPeerRotValid = FALSE;
+		sSYNetPeerGroupMode = (u8)mode;
+		return;
+	}
+	if ((sSYNetPeerRotValid == FALSE) || (sSYNetPeerRotMode != mode))
+	{
+		/* Fresh line-up: the first two in, then everyone else in order. */
+		sSYNetPeerRotPlayers[0] = -1;
+		sSYNetPeerRotPlayers[1] = -1;
+		sSYNetPeerRotKing = -1;
+		sSYNetPeerQueueCount = 0;
+		after_match = FALSE;
+	}
+	else if (after_match != FALSE)
+	{
+		s32 winner = syNetPeerGetWinnerSlot();
+		s32 loser;
+
+		if (winner < 0)
+		{
+			/* A tie: the one who was already on stays. */
+			winner = ((sSYNetPeerRotKing >= 0) && (sSYNetPeerRotPlayers[1] == sSYNetPeerRotKing)) ? 1 : 0;
+		}
+		loser = 1 - winner;
+		sSYNetPeerRotKing = sSYNetPeerRotPlayers[winner];
+
+		if ((sSYNetPeerQueueCount > 0) && (sSYNetPeerRotPlayers[loser] >= 0))
+		{
+			s32 challenger;
+
+			syNetPeerQueuePush(sSYNetPeerRotPlayers[loser]);
+			challenger = syNetPeerQueuePop();
+			port_log("SSB64 NetPeer: winner stays on: slot %d (member %d) won, member %d steps out, member %d is next\n",
+			         winner, sSYNetPeerRotKing, sSYNetPeerRotPlayers[loser], challenger);
+			sSYNetPeerRotPlayers[loser] = challenger;
+		}
+	}
+	/* Forget anyone who left, fill empty ports from the front of the line,
+	 * and line up anyone new at the back. */
+	for (i = 0; i < 2; i++)
+	{
+		if ((sSYNetPeerRotPlayers[i] >= 0) && (sSYNetPeerMembers[sSYNetPeerRotPlayers[i]].is_used == FALSE))
+		{
+			sSYNetPeerRotPlayers[i] = -1;
+		}
+	}
+	for (i = sSYNetPeerQueueCount - 1; i >= 0; i--)
+	{
+		if (sSYNetPeerMembers[sSYNetPeerQueue[i]].is_used == FALSE)
+		{
+			syNetPeerQueueRemove(sSYNetPeerQueue[i]);
+		}
+	}
+	for (i = 0; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		s32 q;
+		sb32 is_listed = ((sSYNetPeerRotPlayers[0] == i) || (sSYNetPeerRotPlayers[1] == i)) ? TRUE : FALSE;
+
+		for (q = 0; q < sSYNetPeerQueueCount; q++)
+		{
+			if (sSYNetPeerQueue[q] == i)
+			{
+				is_listed = TRUE;
+			}
+		}
+		if ((sSYNetPeerMembers[i].is_used != FALSE) && (is_listed == FALSE))
+		{
+			syNetPeerQueuePush(i);
+		}
+	}
+	for (i = 0; i < 2; i++)
+	{
+		if (sSYNetPeerRotPlayers[i] < 0)
+		{
+			sSYNetPeerRotPlayers[i] = syNetPeerQueuePop();
+		}
+	}
+	for (i = 0; i < 2; i++)
+	{
+		if (sSYNetPeerRotPlayers[i] >= 0)
+		{
+			sSYNetPeerMembers[sSYNetPeerRotPlayers[i]].slot = i;
+		}
+	}
+	for (i = 0; i < sSYNetPeerQueueCount; i++)
+	{
+		sSYNetPeerMembers[sSYNetPeerQueue[i]].queue_pos = i;
+	}
+	sSYNetPeerRotValid = TRUE;
+	sSYNetPeerRotMode = (u8)mode;
+	sSYNetPeerGroupMode = (u8)mode;
+}
+
+/* Host: fill sSYNetPeerRound from the member table and the host's VS
+ * state. Player ports are human, every other port is closed. */
+void syNetPeerHostMakeRound(s32 scene, s32 scene_prev)
+{
+	SYNetPeerRound *r = &sSYNetPeerRound;
+	s32 i;
+
+	r->session_id = sSYNetPeerSessionID;
+	r->session_base = sSYNetPeerSessionBase;
+	r->session_phase = sSYNetPeerSessionPhase;
+	r->your_member = 0;
+	r->mode = sSYNetPeerGroupMode;
+	r->flags = (port_lobby_preset() != 0) ? SYNETPEER_ROUND_FLAG_PRESET : 0;
+	r->scene = (u8)scene;
+	r->scene_prev = (u8)scene_prev;
+	r->seed = (port_netsock_now_ms() * 2654435761U) | 1U;
+
+	for (i = 0; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		SYNetPeerMember *m = &sSYNetPeerMembers[i];
+
+		r->used[i] = (u8)m->is_used;
+		r->in_round[i] = (u8)m->is_in_round;
+		r->slot[i] = (m->slot >= 0) ? (u8)m->slot : SYNETPEER_SLOT_NONE;
+		r->queue_pos[i] = (m->queue_pos >= 0) ? (u8)m->queue_pos : SYNETPEER_SLOT_NONE;
+		syNetPeerCopyCode(r->code[i], m->code);
+	}
+	syNetReplayCaptureBattleMetadata(&gSCManagerTransferBattleState, &r->metadata);
+	r->metadata.rng_seed = r->seed;
+	r->metadata.player_count = 0;
+
+	for (i = 0; i < MAXCONTROLLERS; i++)
+	{
+		r->metadata.player_kinds[i] = nFTPlayerKindNot;
+	}
+	for (i = 0; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		if ((r->used[i] != FALSE) && (r->slot[i] < MAXCONTROLLERS))
+		{
+			r->metadata.player_kinds[r->slot[i]] = nFTPlayerKindMan;
+			r->metadata.player_count++;
+		}
+	}
+	if (r->flags & SYNETPEER_ROUND_FLAG_PRESET)
+	{
+		r->metadata.stage_kind = nGRKindPupupu;
+		r->metadata.is_stage_select = FALSE;
+		r->metadata.item_switch = nSCBattleItemSwitchNone;
+		r->metadata.item_appearance_rate = nSCBattleItemSwitchNone;
+	}
+	r->unlock_mask = gSCManagerBackupData.unlock_mask;
+	r->fighter_mask = gSCManagerBackupData.fighter_mask;
+}
+
+/* Host: drop the dead, decide the line-up and start telling everyone. The
+ * exchange itself runs per frame in syNetPeerServiceRound. */
+void syNetPeerHostStartRound(sb32 after_match, s32 scene, s32 scene_prev)
+{
+	s32 i;
+
+	for (i = 1; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		if ((sSYNetPeerMembers[i].is_used != FALSE) && (syNetPeerMemberSilentMs(i) > SYNETPEER_ROUND_MEMBER_TIMEOUT_MS))
+		{
+			sSYNetPeerMembers[i].is_used = FALSE;
+			port_log("SSB64 NetPeer: member %d (%s) went quiet, dropped\n", i, sSYNetPeerMembers[i].code);
+		}
+	}
+	syNetPeerHostBuildRoster(after_match);
+	sSYNetPeerSessionPhase++;
+	syNetPeerResetPhaseState();
+	syNetPeerHostMakeRound(scene, scene_prev);
+	sSYNetPeerRoundState = 1;
+	sSYNetPeerRoundFrames = 0;
+	sSYNetPeerRoundStartMs = port_netsock_now_ms();
+	sSYNetPeerRoundApplyPending = FALSE;
+
+	port_log("SSB64 NetPeer: round start session=%u mode=%u members=%d slots=%d/%d/%d/%d after_match=%d\n",
+	         sSYNetPeerSessionID, sSYNetPeerGroupMode, syNetPeerCountUsedMembers(), sSYNetPeerMembers[0].slot,
+	         sSYNetPeerMembers[1].slot, sSYNetPeerMembers[2].slot, sSYNetPeerMembers[3].slot, after_match);
+}
+
+/* Both ends: the round in sSYNetPeerRound becomes the session's state, and
+ * we drop into its scene in lockstep from whatever we were doing. */
+void syNetPeerApplyRound(void)
+{
+	SYNetPeerRound *r = &sSYNetPeerRound;
+	s32 i;
+
+	sSYNetPeerSessionBase = r->session_base;
+	sSYNetPeerSessionPhase = r->session_phase;
+	syNetPeerResetPhaseState();
+
+	if (sSYNetPeerIsHub == FALSE)
+	{
+		sSYNetPeerMyMember = r->your_member;
+
+		for (i = 0; i < SYNETPEER_MAX_MEMBERS; i++)
+		{
+			SYNetPeerMember *m = &sSYNetPeerMembers[i];
+
+			m->is_used = (i == 0) ? TRUE : r->used[i];
+			m->is_in_round = r->in_round[i];
+			m->slot = (r->slot[i] == SYNETPEER_SLOT_NONE) ? -1 : r->slot[i];
+			m->queue_pos = (r->queue_pos[i] == SYNETPEER_SLOT_NONE) ? -1 : r->queue_pos[i];
+			syNetPeerCopyCode(m->code, r->code[i]);
+		}
+		if (sSYNetPeerMasksOverridden == FALSE)
+		{
+			sSYNetPeerSavedUnlockMask = gSCManagerBackupData.unlock_mask;
+			sSYNetPeerSavedFighterMask = gSCManagerBackupData.fighter_mask;
+			sSYNetPeerMasksOverridden = TRUE;
+		}
+		gSCManagerBackupData.unlock_mask = (u8)r->unlock_mask;
+		gSCManagerBackupData.fighter_mask = (u16)r->fighter_mask;
+	}
+	sSYNetPeerGroupMode = r->mode;
+	sSYNetPeerRoundFlags = r->flags;
+	syNetPeerApplySlots();
+	port_netplay_set_hazards_off((r->flags & SYNETPEER_ROUND_FLAG_PRESET) ? 1 : 0);
+
+	/* A battle we are leaving early (a player dropped mid-match): its
+	 * rollback session ends here, and its scene's own stop is a no-op. */
+	if (sSYNetPeerBattleRunning != FALSE)
+	{
+		syNetStateStopVSSession();
+		sSYNetPeerBattleRunning = FALSE;
+	}
+	sSYNetPeerMenuMode = TRUE;
+	sSYNetPeerIsActive = TRUE;
+	sSYNetPeerLobbyActive = FALSE;
+	sSYNetPeerPostMatch = FALSE;
+	sSYNetPeerBootstrapSeed = r->seed;
+	syNetPeerApplyBootstrapMetadata(&r->metadata);
+	gSCManagerTransferBattleState.is_stage_select = r->metadata.is_stage_select;
+	/* Who plays which port may have changed: every round starts the
+	 * character select from fresh slots on every machine. */
+	gSCManagerTransferBattleState.is_reset_players = TRUE;
+	syUtilsSetRandomSeed(r->seed);
+
+	sSYNetPeerRoundState = 0;
+	sSYNetPeerRoundApplyPending = FALSE;
+	sSYNetPeerRoundAwaiting = FALSE;
+	sSYNetPeerRoundsApplied++;
+
+	syNetMenuStop();
+	syNetMenuStart(sSYNetPeerLocalPlayer, sSYNetPeerRemoteMask, sSYNetPeerInputDelay, r->scene, r->seed, TRUE);
+	syNetPeerApplyEarlyFrames();
+	portSCManagerRequestResetTo(r->scene, r->scene_prev);
+	port_lobby_notify_round();
+
+	port_log("SSB64 NetPeer: round applied session=%u member=%d slot=%d remote_mask=0x%x scene=%u preset=%d\n",
+	         sSYNetPeerSessionID, sSYNetPeerMyMember, sSYNetPeerLocalPlayer, sSYNetPeerRemoteMask, r->scene,
+	         (r->flags & SYNETPEER_ROUND_FLAG_PRESET) ? 1 : 0);
+}
+
+void syNetPeerSendRoundStart(void)
+{
+	u8 buffer[SYNETPEER_CONTROL_PACKET_BYTES];
+
+	syNetPeerMakeControlPacket(buffer, SYNETPEER_PACKET_ROUND_START, sSYNetPeerRoundSession);
+	syNetPeerSendToRound(buffer, SYNETPEER_CONTROL_PACKET_BYTES, -1);
+}
+
+/* Once per frame from wherever the session is (menus, battle, lobby): move
+ * a round exchange along. TRUE = a round was applied just now (the caller's
+ * scene is being reset; do nothing more with it this frame). */
+sb32 syNetPeerServiceRound(void)
+{
+	if ((sSYNetPeerIsEnabled == FALSE) || (sSYNetPeerMenuMode == FALSE))
+	{
+		return FALSE;
+	}
+	syNetPeerReceiveAll();
+
+	if (sSYNetPeerRoundStartRepeat != 0)
+	{
+		sSYNetPeerRoundStartRepeat--;
+		syNetPeerSendRoundStart();
+	}
+	if (sSYNetPeerIsHub != FALSE)
+	{
+		s32 i;
+
+		if (sSYNetPeerRoundState != 1)
+		{
+			return FALSE;
+		}
+		sSYNetPeerRoundFrames++;
+
+		for (i = 1; i < SYNETPEER_MAX_MEMBERS; i++)
+		{
+			SYNetPeerMember *m = &sSYNetPeerMembers[i];
+
+			if ((m->is_used == FALSE) || (m->is_ready != FALSE))
+			{
+				continue;
+			}
+			if ((port_netsock_now_ms() - sSYNetPeerRoundStartMs) > SYNETPEER_ROUND_MEMBER_TIMEOUT_MS)
+			{
+				/* Never answered: they are gone. Line up again without them. */
+				port_log("SSB64 NetPeer: member %d (%s) did not answer the round, dropped\n", i, m->code);
+				m->is_used = FALSE;
+				syNetPeerHostStartRound(FALSE, sSYNetPeerRound.scene, sSYNetPeerRound.scene_prev);
+				return FALSE;
+			}
+			if ((sSYNetPeerRoundFrames % SYNETPEER_ROUND_RESEND_FRAMES) == 1)
+			{
+				syNetPeerSendRoundConfigTo(i);
+			}
+		}
+		if (syNetPeerCheckRoundMembers(0, FALSE) == FALSE)
+		{
+			return FALSE;
+		}
+		if (syNetPeerCountUsedMembers() < 2)
+		{
+			/* Everyone else left: nothing to play. */
+			syNetPeerAbortMatch("everyone else left");
+			return TRUE;
+		}
+		sSYNetPeerRoundSession = sSYNetPeerSessionID;
+		sSYNetPeerRoundStartRepeat = SYNETPEER_ROUND_START_REPEAT;
+		syNetPeerSendRoundStart();
+		syNetPeerApplyRound();
+		return TRUE;
+	}
+	/* Guest. */
+	if (sSYNetPeerRoundApplyPending != FALSE)
+	{
+		syNetPeerApplyRound();
+		return TRUE;
+	}
+	if ((sSYNetPeerRoundAwaiting != FALSE) || (sSYNetPeerRoundState == 1))
+	{
+		u32 now = port_netsock_now_ms();
+
+		if ((now - sSYNetPeerLastPingMs) >= 500)
+		{
+			sSYNetPeerLastPingMs = now;
+			syNetPeerSendPingPacket(SYNETPEER_PACKET_PING, now);
+		}
+		if (syNetPeerMemberSilentMs(0) > SYNETPEER_HOST_SILENT_MS)
+		{
+			syNetPeerGuestHostGone("lost the host");
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+/* sys/netmenu.c: the results screen of a group session just ended (both
+ * ends see this on the same lockstep tick). The host lines up the next
+ * round; guests wait for it. */
+void syNetPeerOnMatchCycleEnd(void)
+{
+	if ((sSYNetPeerMenuMode == FALSE) || (sSYNetPeerIsEnabled == FALSE))
+	{
+		return;
+	}
+	if (sSYNetPeerIsHub != FALSE)
+	{
+		if (sSYNetPeerRoundState == 0)
+		{
+			syNetPeerHostStartRound(TRUE, nSCKindPlayersVS, nSCKindVSMode);
+		}
+	}
+	else if (sSYNetPeerRoundState == 0)
+	{
+		sSYNetPeerRoundAwaiting = TRUE;
+	}
+}
+
+/* TRUE while a round exchange keeps the menus from ticking. */
+sb32 syNetPeerCheckRoundBusy(void)
+{
+	if (sSYNetPeerMenuMode == FALSE)
+	{
+		return FALSE;
+	}
+	if (sSYNetPeerIsHub != FALSE)
+	{
+		return (sSYNetPeerRoundState == 1) ? TRUE : FALSE;
+	}
+	return ((sSYNetPeerRoundAwaiting != FALSE) || (sSYNetPeerRoundApplyPending != FALSE)) ? TRUE : FALSE;
+}
+
+/* 1 = in the session's menus (enter the battle / VS menu), 0 = still going,
+ * -1 = gave up. */
 s32 syNetPeerLobbyStep(void)
 {
+	if (sSYNetPeerMenuMode != FALSE)
+	{
+		if (sSYNetPeerIsEnabled == FALSE)
+		{
+			return -1;
+		}
+		syNetPeerServiceRound();
+
+		if (sSYNetPeerIsEnabled == FALSE)
+		{
+			return -1;
+		}
+		return (sSYNetPeerRoundsApplied != 0) ? 1 : 0;
+	}
 	if (sSYNetPeerLobbyActive == FALSE)
 	{
 		return -1;
@@ -1010,7 +2304,7 @@ s32 syNetPeerLobbyStep(void)
 			syNetPeerSendMatchConfigPacket();
 			syNetPeerReceiveBootstrapPackets();
 
-			if (sSYNetPeerBootstrapPeerReady != FALSE)
+			if (syNetPeerCheckBootstrapPeersReady() != FALSE)
 			{
 				sSYNetPeerLobbyPhase = 1;
 				sSYNetPeerLobbyStartRepeat = 30;
@@ -1052,25 +2346,11 @@ s32 syNetPeerLobbyStep(void)
 	}
 	if (sSYNetPeerLobbyPhase == 2)
 	{
-		extern void portSCManagerRequestResetTo(s32 scene, s32 scene_prev);
-
 		port_log("SSB64 NetPeer: lobby bootstrap complete role=%s stage=%u seed=%u\n",
 		         (sSYNetPeerBootstrapIsHost != FALSE) ? "host" : "client", sSYNetPeerBootstrapMetadata.stage_kind,
 		         sSYNetPeerBootstrapMetadata.rng_seed);
 		sSYNetPeerLobbyActive = FALSE;
 
-		if (sSYNetPeerMenuMode != FALSE)
-		{
-			/* Both players leave whatever they were doing for the VS menu
-			 * and run it in lockstep from its first frame. Same seed on both
-			 * sides, so a random pick in the character select agrees too. */
-			syNetPeerBeginPhase();
-			syUtilsSetRandomSeed(sSYNetPeerBootstrapSeed);
-			syNetMenuStart(sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer, sSYNetPeerInputDelay, nSCKindVSMode,
-			               sSYNetPeerBootstrapSeed);
-			portSCManagerRequestResetTo(nSCKindVSMode, nSCKindModeSelect);
-			return 1;
-		}
 		/* Both players leave whatever menu they are in for the battle; the
 		 * battle state itself was written by syNetPeerApplyBootstrapMetadata. */
 		portSCManagerRequestResetTo(nSCKindVSBattle, nSCKindVSMode);
@@ -1079,8 +2359,26 @@ s32 syNetPeerLobbyStep(void)
 	return 0;
 }
 
+void syNetPeerSendBye(void)
+{
+	u8 buffer[SYNETPEER_CONTROL_PACKET_BYTES];
+	s32 i;
+
+	if (sSYNetPeerSocket < 0)
+	{
+		return;
+	}
+	syNetPeerMakeControlPacket(buffer, SYNETPEER_PACKET_BYE, sSYNetPeerSessionID);
+
+	for (i = 0; i < SYNETPEER_STOP_REPEAT_PACKETS; i++)
+	{
+		syNetPeerSendToAll(buffer, SYNETPEER_CONTROL_PACKET_BYTES);
+	}
+}
+
 void syNetPeerLobbyAbort(void)
 {
+	syNetPeerSendBye();
 	sSYNetPeerLobbyActive = FALSE;
 	sSYNetPeerMenuMode = FALSE; /* so the stop below does not re-arm the menus */
 	syNetMenuStop();
@@ -1089,9 +2387,8 @@ void syNetPeerLobbyAbort(void)
 	syNetPeerResetConfig();
 }
 
-void syNetPeerHandlePacket(const u8 *buffer, s32 size);
 
-/* ---- Rematch (between games of a lobby match) ----
+/* ---- Rematch (between games of a quick match) ----
  * syNetPeerStopVSSession keeps the socket of a lobby match open and marks
  * the session post-match; the Netplay page offers Rematch / Leave. Each side
  * that wants another game sends REMATCH (with its fighter pick) every half
@@ -1123,13 +2420,11 @@ sb32 syNetPeerCheckPeerWantsRematch(void)
  * lobby session. */
 s32 syNetPeerRematchStep(void)
 {
-	u8 buffer[SYNETPEER_PACKET_BYTES];
-
 	if (sSYNetPeerPostMatch == FALSE)
 	{
 		return -1;
 	}
-	syNetPeerReceiveAll(syNetPeerHandlePacket, buffer, sizeof(buffer));
+	syNetPeerReceiveAll();
 
 	if (sSYNetPeerRematchLocal != FALSE)
 	{
@@ -1145,12 +2440,13 @@ s32 syNetPeerRematchStep(void)
 		u8 host_fighter = (is_host != FALSE) ? sSYNetPeerRematchLocalFighter : sSYNetPeerRematchPeerFighter;
 		u8 client_fighter = (is_host != FALSE) ? sSYNetPeerRematchPeerFighter : sSYNetPeerRematchLocalFighter;
 		u32 seed = (u32)port_netsock_now_ms() | 1u;
+		PortNetAddr peer = sSYNetPeerPeerAddress;
 
 		port_log("SSB64 NetPeer: rematch agreed, fighters=%u/%u\n", host_fighter, client_fighter);
 		/* Let the peer see our REMATCH a few more times in case theirs
 		 * arrived first and ours was lost; the bootstrap repeats anyway. */
 		syNetPeerSendPingPacket(SYNETPEER_PACKET_REMATCH, sSYNetPeerRematchLocalFighter);
-		syNetPeerLobbyConfigure(sSYNetPeerSocket, &sSYNetPeerPeerAddress, is_host, sSYNetPeerLobbyDelay,
+		syNetPeerLobbyConfigure(sSYNetPeerSocket, &peer, is_host, sSYNetPeerLobbyDelay,
 		                        sSYNetPeerSessionID, seed, host_fighter, client_fighter, sSYNetPeerLobbyStage,
 		                        sSYNetPeerLobbyStocks, sSYNetPeerLobbyTimeMinutes, FALSE);
 		return 1;
@@ -1158,16 +2454,16 @@ s32 syNetPeerRematchStep(void)
 	return 0;
 }
 
-/* The match cannot continue (peer gone, or they quit): tear the session
- * down, tell the lobby why, and send the player back to the VS menu. Safe
- * to call from inside the tick: the scene change lands at the next frame
- * boundary like the console-reset path. */
+/* The match cannot continue (we quit, the host is gone, or nobody is left):
+ * tell the others, tear the session down, tell the lobby why, and send the
+ * player back to the VS menu. Safe to call from inside the tick: the scene
+ * change lands at the next frame boundary like the console-reset path. */
 void syNetPeerAbortMatch(const char *reason)
 {
-	extern void portSCManagerRequestResetTo(s32 scene, s32 scene_prev);
 	extern void port_lobby_notify_match_over(const char *reason);
 
 	port_log("SSB64 NetPeer: match aborted: %s\n", reason);
+	syNetPeerSendBye();
 	syNetStateStopVSSession();
 	sSYNetPeerLobbySession = FALSE; /* no rematch after a lost connection */
 	sSYNetPeerMenuMode = FALSE;
@@ -1177,6 +2473,142 @@ void syNetPeerAbortMatch(const char *reason)
 	syNetPeerResetConfig();
 	port_lobby_notify_match_over(reason);
 	portSCManagerRequestResetTo(nSCKindVSMode, nSCKindVSMode);
+}
+
+void syNetPeerGuestHostGone(const char *reason)
+{
+	syNetPeerAbortMatch(reason);
+}
+
+/* Host: a guest is gone (BYE, or silent while everyone waited on them). If
+ * they were playing, the round cannot go on: line up a new one without
+ * them. A spectator just stops getting packets. */
+void syNetPeerHostDropMember(s32 member, const char *reason)
+{
+	SYNetPeerMember *m;
+	sb32 was_playing;
+
+	if ((member <= 0) || (member >= SYNETPEER_MAX_MEMBERS) || (sSYNetPeerMembers[member].is_used == FALSE))
+	{
+		return;
+	}
+	m = &sSYNetPeerMembers[member];
+	was_playing = ((m->is_in_round != FALSE) && (m->slot >= 0)) ? TRUE : FALSE;
+	port_log("SSB64 NetPeer: member %d (%s) %s%s\n", member, m->code, reason, (was_playing != FALSE) ? " mid-round" : "");
+	m->is_used = FALSE;
+	m->is_in_round = FALSE;
+
+	if ((sSYNetPeerMenuMode == FALSE) || (sSYNetPeerRoundsApplied == 0))
+	{
+		if ((sSYNetPeerMenuMode == FALSE) && (was_playing != FALSE))
+		{
+			syNetPeerAbortMatch("the other player left");
+		}
+		return;
+	}
+	if (syNetPeerCountUsedMembers() < 2)
+	{
+		syNetPeerAbortMatch("everyone else left");
+		return;
+	}
+	if ((was_playing != FALSE) && (sSYNetPeerRoundState == 0))
+	{
+		syNetPeerHostStartRound(FALSE, nSCKindPlayersVS, nSCKindVSMode);
+	}
+}
+
+/* sys/netmenu.c and sys/netstate.c: we have waited ten seconds for someone's
+ * input. A guest only gives up if the host itself is gone (otherwise the
+ * host is sorting it out). The host drops whoever went quiet and goes on
+ * with everyone else. */
+void syNetPeerReportStall(const char *reason)
+{
+	s32 i;
+	sb32 dropped = FALSE;
+
+	if ((sSYNetPeerMenuMode == FALSE) || (sSYNetPeerRoundsApplied == 0))
+	{
+		syNetPeerAbortMatch(reason);
+		return;
+	}
+	if (sSYNetPeerIsHub == FALSE)
+	{
+		if (syNetPeerMemberSilentMs(0) > SYNETPEER_SILENT_MS)
+		{
+			syNetPeerAbortMatch(reason);
+		}
+		return;
+	}
+	for (i = 1; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		SYNetPeerMember *m = &sSYNetPeerMembers[i];
+
+		if ((m->is_used != FALSE) && (m->is_in_round != FALSE) && (m->slot >= 0) &&
+		    (syNetPeerMemberSilentMs(i) > SYNETPEER_SILENT_MS))
+		{
+			m->slot = -1; /* so the drop below lines up a new round only once */
+			m->is_used = FALSE;
+			dropped = TRUE;
+			port_log("SSB64 NetPeer: member %d (%s) stopped sending, dropped\n", i, m->code);
+		}
+	}
+	if (dropped == FALSE)
+	{
+		/* Everyone still answers pings, yet the game has not moved for ten
+		 * seconds: the players' games no longer agree (one already left
+		 * the battle the other is still in). Start over from the
+		 * character select with the same roster. */
+		if (sSYNetPeerRoundState == 0)
+		{
+			port_log("SSB64 NetPeer: stuck with everyone connected (%s), restarting at character select\n", reason);
+			syNetPeerHostStartRound(FALSE, nSCKindPlayersVS, nSCKindVSMode);
+		}
+		return;
+	}
+	if (syNetPeerCountUsedMembers() < 2)
+	{
+		syNetPeerAbortMatch("everyone else left");
+		return;
+	}
+	if (sSYNetPeerRoundState == 0)
+	{
+		syNetPeerHostStartRound(FALSE, nSCKindPlayersVS, nSCKindVSMode);
+	}
+}
+
+/* ---- What the lobby panel shows ---- */
+s32 syNetPeerGetMemberInfo(s32 member, const char **code, s32 *slot, s32 *queue_pos, sb32 *is_me)
+{
+	SYNetPeerMember *m;
+
+	if ((member < 0) || (member >= SYNETPEER_MAX_MEMBERS) || (sSYNetPeerIsEnabled == FALSE) ||
+	    (sSYNetPeerMenuMode == FALSE))
+	{
+		return FALSE;
+	}
+	m = &sSYNetPeerMembers[member];
+
+	if ((m->is_used == FALSE) && !((sSYNetPeerIsHub == FALSE) && (sSYNetPeerRound.used[member] != FALSE)))
+	{
+		return FALSE;
+	}
+	*code = m->code;
+	*slot = (m->is_in_round != FALSE) ? m->slot : -1;
+	*queue_pos = m->queue_pos;
+	*is_me = (member == sSYNetPeerMyMember) ? TRUE : FALSE;
+
+	return TRUE;
+}
+
+sb32 syNetPeerCheckSpectating(void)
+{
+	return ((sSYNetPeerIsEnabled != FALSE) && (sSYNetPeerMenuMode != FALSE) && (sSYNetPeerRoundsApplied != 0) &&
+	        (sSYNetPeerLocalPlayer < 0)) ? TRUE : FALSE;
+}
+
+sb32 syNetPeerCheckGroupHost(void)
+{
+	return ((sSYNetPeerIsEnabled != FALSE) && (sSYNetPeerMenuMode != FALSE) && (sSYNetPeerIsHub != FALSE)) ? TRUE : FALSE;
 }
 #endif
 
@@ -1270,6 +2702,12 @@ void syNetPeerInitDebugEnv(void)
 		return;
 	}
 	sSYNetPeerIsConfigured = TRUE;
+	{
+		s32 local_player = sSYNetPeerLocalPlayer;
+		s32 remote_player = sSYNetPeerRemotePlayer;
+
+		syNetPeerSetupPair(&sSYNetPeerPeerAddress, sSYNetPeerBootstrapIsHost, local_player, remote_player);
+	}
 	port_log("SSB64 NetPeer: configured local=%d remote=%d delay=%u session=%u bootstrap=%d host=%d seed=%u bind=%s peer=%s\n",
 	         sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer, sSYNetPeerInputDelay,
 	         sSYNetPeerSessionID, sSYNetPeerBootstrapIsEnabled, sSYNetPeerBootstrapIsHost,
@@ -1304,9 +2742,22 @@ void syNetPeerStartVSSession(void)
 
 		if (syNetPeerRunBootstrap() == FALSE)
 		{
-			syNetPeerAbortMatch("the other player did not start the match");
+			/* The host may have started a new round instead (a player
+			 * dropped): that resets us into it. Otherwise give up. */
+			if (sSYNetPeerRoundApplyPending != FALSE)
+			{
+				syNetPeerServiceRound();
+				return;
+			}
+			syNetPeerReportStall("the other player did not start the match");
+
+			if (sSYNetPeerIsHub != FALSE)
+			{
+				syNetPeerAbortMatch("the other player did not start the match");
+			}
 			return;
 		}
+		sSYNetPeerBattleRunning = TRUE;
 	}
 	sSYNetPeerHighestRemoteTick = 0;
 	sSYNetPeerPacketsSent = 0;
@@ -1326,10 +2777,24 @@ void syNetPeerStartVSSession(void)
 	sSYNetPeerLastPacketTicksValid = FALSE;
 	sSYNetPeerRemoteAdvantage = 0;
 	sSYNetPeerRemoteAdvantageValid = FALSE;
+	{
+		s32 slot;
+
+		for (slot = 0; slot < MAXCONTROLLERS; slot++)
+		{
+			sSYNetPeerSlotHighestTick[slot] = 0;
+			sSYNetPeerSlotHasTick[slot] = FALSE;
+			sSYNetPeerSlotAdvantageValid[slot] = FALSE;
+		}
+	}
 	sSYNetPeerPingMs = 0;
 	sSYNetPeerPingFrames = 0;
 	sSYNetPeerIsActive = TRUE;
-	sSYNetPeerBattleBarrierEnabled = sSYNetPeerBootstrapIsEnabled;
+	/* Watching keeps the barrier too, released locally once the players'
+	 * first input is in (syNetPeerUpdateStartBarrier): the frame that
+	 * releases it runs one battle step on tick 0's input before the tick
+	 * advances, and a spectator has to take that same step. */
+	sSYNetPeerBattleBarrierEnabled = (sSYNetPeerBootstrapIsEnabled != FALSE) ? TRUE : FALSE;
 	sSYNetPeerBattleLocalReady = sSYNetPeerBattleBarrierEnabled;
 	sSYNetPeerBattlePeerReady = FALSE;
 	sSYNetPeerBattleStartSent = FALSE;
@@ -1340,15 +2805,32 @@ void syNetPeerStartVSSession(void)
 	sSYNetPeerExecutionHoldFrames = 0;
 	sSYNetPeerExecutionBeginLogged = (sSYNetPeerBattleBarrierEnabled == FALSE) ? TRUE : FALSE;
 
-	syNetInputSetSlotSource(sSYNetPeerLocalPlayer, nSYNetInputSourceLocal);
-	syNetInputSetSlotSource(sSYNetPeerRemotePlayer, nSYNetInputSourceRemotePredicted);
-	syNetInputSetLocalDelay(sSYNetPeerInputDelay);
-	/* The client is player 2 but holds its controller in port 1. */
-	syNetInputSetLocalHardwarePort((gSYControllerDeviceStatuses[0] >= 0) ? gSYControllerDeviceStatuses[0] : 0);
+	{
+		s32 slot;
 
-	port_log("SSB64 NetPeer: VS session start role=%s local=%d remote=%d delay=%u barrier=%d tick=%u\n",
+		/* Every port someone else plays is predicted and corrected by
+		 * rollback; ours reads our pad; an empty port reads neutral. */
+		for (slot = 0; slot < MAXCONTROLLERS; slot++)
+		{
+			if (slot == sSYNetPeerLocalPlayer)
+			{
+				syNetInputSetSlotSource(slot, nSYNetInputSourceLocal);
+			}
+			else if (sSYNetPeerRemoteMask & (1 << slot))
+			{
+				syNetInputSetSlotSource(slot, nSYNetInputSourceRemotePredicted);
+			}
+			else syNetInputSetSlotSource(slot, nSYNetInputSourceSaved);
+		}
+	}
+	syNetInputSetLocalDelay(sSYNetPeerInputDelay);
+	/* A guest plays port 2 (or 3, 4) but holds its controller in port 1. */
+	syNetInputSetLocalHardwarePort((gSYControllerDeviceStatuses[0] >= 0) ? gSYControllerDeviceStatuses[0] : 0);
+	syNetPeerApplyEarlyFrames();
+
+	port_log("SSB64 NetPeer: VS session start role=%s local=%d remote_mask=0x%x delay=%u barrier=%d tick=%u\n",
 	         (sSYNetPeerBootstrapIsHost != FALSE) ? "host" : "client",
-	         sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer, sSYNetPeerInputDelay,
+	         sSYNetPeerLocalPlayer, sSYNetPeerRemoteMask, sSYNetPeerInputDelay,
 	         sSYNetPeerBattleBarrierEnabled, syNetInputGetTick());
 #endif
 }
@@ -1428,7 +2910,7 @@ void syNetPeerBuildPacket(u8 *buffer, u32 *out_size)
 	syNetPeerWriteU8(&cursor, (u8)sSYNetPeerLocalPlayer);
 	syNetPeerWriteU8(&cursor, (u8)frame_count);
 	syNetPeerWriteU8(&cursor, (u8)sSYNetPeerLocalPlayer);
-	syNetPeerWriteU8(&cursor, (u8)sSYNetPeerRemotePlayer);
+	syNetPeerWriteU8(&cursor, SYNETPEER_SLOT_NONE); /* was "remote player"; a group has several */
 
 	for (i = 0; i < SYNETPEER_MAX_PACKET_FRAMES; i++)
 	{
@@ -1449,21 +2931,27 @@ void syNetPeerSendLocalInput(void)
 	u8 buffer[SYNETPEER_PACKET_BYTES];
 	u32 size;
 
+	/* Watching: there is nothing of ours to send. */
+	if ((sSYNetPeerLocalPlayer < 0) || (sSYNetPeerLocalPlayer >= MAXCONTROLLERS))
+	{
+		return;
+	}
 	syNetPeerBuildPacket(buffer, &size);
 
 	if (size == 0)
 	{
 		return;
 	}
-	if (port_netsock_sendto(sSYNetPeerSocket, buffer, (s32)size, &sSYNetPeerPeerAddress) == (s32)size)
-	{
-		sSYNetPeerPacketsSent++;
-		sSYNetPeerSendSeq++;
-	}
+	syNetPeerSendToRound(buffer, size, -1);
+	sSYNetPeerPacketsSent++;
+	sSYNetPeerSendSeq++;
 #endif
 }
 
-void syNetPeerHandlePacket(const u8 *buffer, s32 size)
+/* An input packet from a member. A guest's arrives at the host, which
+ * forwards it unchanged to everyone else in the round; at a guest every
+ * input packet comes from the host, its own or forwarded. */
+void syNetPeerHandleInputPacket(const u8 *buffer, s32 size, s32 member)
 {
 	const u8 *cursor = buffer;
 	SYNetPeerPacketFrame frames[SYNETPEER_MAX_PACKET_FRAMES];
@@ -1478,22 +2966,9 @@ void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 	u8 player;
 	u8 frame_count;
 	u8 packet_local_player;
-	u8 packet_remote_player;
 	u32 current_tick = syNetInputGetTick();
 	s32 i;
 
-#ifdef PORT
-	if (size == SYNETPEER_CONTROL_PACKET_BYTES)
-	{
-		syNetPeerHandleControlPacket(buffer, size);
-		return;
-	}
-	if (size == SYNETPEER_PING_PACKET_BYTES)
-	{
-		syNetPeerHandlePingPacket(buffer, size);
-		return;
-	}
-#endif
 	if (size != SYNETPEER_PACKET_BYTES)
 	{
 		sSYNetPeerPacketsDropped++;
@@ -1510,13 +2985,10 @@ void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 	player = syNetPeerReadU8(&cursor);
 	frame_count = syNetPeerReadU8(&cursor);
 	packet_local_player = syNetPeerReadU8(&cursor);
-	packet_remote_player = syNetPeerReadU8(&cursor);
+	(void)syNetPeerReadU8(&cursor);
 
-	if ((magic != SYNETPEER_MAGIC) || (version != SYNETPEER_VERSION) ||
-		(session_id != sSYNetPeerSessionID) || (player != (u8)sSYNetPeerRemotePlayer) ||
-		(packet_local_player != (u8)sSYNetPeerRemotePlayer) ||
-		(packet_remote_player != (u8)sSYNetPeerLocalPlayer) ||
-		(frame_count > SYNETPEER_MAX_PACKET_FRAMES))
+	if ((magic != SYNETPEER_MAGIC) || (version != SYNETPEER_VERSION) || (player >= MAXCONTROLLERS) ||
+		(packet_local_player != player) || (frame_count > SYNETPEER_MAX_PACKET_FRAMES))
 	{
 		sSYNetPeerPacketsDropped++;
 		return;
@@ -1536,33 +3008,62 @@ void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 		sSYNetPeerPacketsDropped++;
 		return;
 	}
-	sSYNetPeerPacketsReceived++;
-	sSYNetPeerRemoteAdvantage = remote_advantage;
-	sSYNetPeerRemoteAdvantageValid = TRUE;
-
-	if (sSYNetPeerRecvSeqInitialized == FALSE)
+#ifdef PORT
+	if (sSYNetPeerIsHub != FALSE)
 	{
-		sSYNetPeerRecvSeqHighWater = packet_seq;
-		sSYNetPeerRecvSeqInitialized = TRUE;
-	}
-	else
-	{
-		if (packet_seq > sSYNetPeerRecvSeqHighWater)
+		/* Only the member playing that port speaks for it. */
+		if ((sSYNetPeerMembers[member].is_in_round == FALSE) || (sSYNetPeerMembers[member].slot != (s32)player))
 		{
-			sSYNetPeerSeqGaps += packet_seq - sSYNetPeerRecvSeqHighWater - 1U;
-			sSYNetPeerRecvSeqHighWater = packet_seq;
+			sSYNetPeerPacketsDropped++;
+			return;
 		}
-		else if (packet_seq == sSYNetPeerRecvSeqHighWater)
+		if ((session_id == sSYNetPeerSessionID) || (session_id == sSYNetPeerSessionID + 1))
 		{
-			sSYNetPeerSeqDuplicates++;
+			syNetPeerSendToRound(buffer, size, member);
+		}
+	}
+	if (session_id == sSYNetPeerSessionID + 1)
+	{
+		/* They are already in the next phase (results while we finish the
+		 * battle): keep it for when we get there. */
+		syNetPeerStashEarlyFrames(session_id, player, frames, frame_count);
+		return;
+	}
+#endif
+	if ((session_id != sSYNetPeerSessionID) || !(sSYNetPeerRemoteMask & (1 << player)))
+	{
+		sSYNetPeerPacketsDropped++;
+		return;
+	}
+	sSYNetPeerPacketsReceived++;
+	sSYNetPeerSlotAdvantage[player] = remote_advantage;
+	sSYNetPeerSlotAdvantageValid[player] = TRUE;
+
+	if (player == sSYNetPeerRemotePlayer)
+	{
+		if (sSYNetPeerRecvSeqInitialized == FALSE)
+		{
+			sSYNetPeerRecvSeqHighWater = packet_seq;
+			sSYNetPeerRecvSeqInitialized = TRUE;
 		}
 		else
 		{
-			sSYNetPeerSeqOutOfOrder++;
+			if (packet_seq > sSYNetPeerRecvSeqHighWater)
+			{
+				sSYNetPeerSeqGaps += packet_seq - sSYNetPeerRecvSeqHighWater - 1U;
+				sSYNetPeerRecvSeqHighWater = packet_seq;
+			}
+			else if (packet_seq == sSYNetPeerRecvSeqHighWater)
+			{
+				sSYNetPeerSeqDuplicates++;
+			}
+			else
+			{
+				sSYNetPeerSeqOutOfOrder++;
+			}
 		}
+		sSYNetPeerLastPeerAckTick = ack_tick;
 	}
-	sSYNetPeerLastPeerAckTick = ack_tick;
-
 	if (frame_count > 0)
 	{
 		u32 oldest_tick_bundle = frames[0].tick;
@@ -1587,7 +3088,7 @@ void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 
 	for (i = 0; i < frame_count; i++)
 	{
-		sb32 is_new_remote_tick = (frames[i].tick > sSYNetPeerHighestRemoteTick) ? TRUE : FALSE;
+		sb32 is_new_remote_tick = ((sSYNetPeerSlotHasTick[player] == FALSE) || (frames[i].tick > sSYNetPeerSlotHighestTick[player])) ? TRUE : FALSE;
 
 		if ((is_new_remote_tick != FALSE) && (frames[i].tick < current_tick))
 		{
@@ -1595,28 +3096,54 @@ void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 		}
 		if (is_new_remote_tick != FALSE)
 		{
-			sSYNetPeerHighestRemoteTick = frames[i].tick;
+			sSYNetPeerSlotHighestTick[player] = frames[i].tick;
+			sSYNetPeerSlotHasTick[player] = TRUE;
 		}
 		syNetInputSetRemoteInput
 		(
-			sSYNetPeerRemotePlayer,
+			player,
 			frames[i].tick,
 			frames[i].buttons,
 			frames[i].stick_x,
 			frames[i].stick_y
 		);
 		sSYNetPeerFramesStaged++;
-		sSYNetPeerInputChecksum = syNetPeerChecksumAccumulateU32(sSYNetPeerInputChecksum, sSYNetPeerRemotePlayer);
+		sSYNetPeerInputChecksum = syNetPeerChecksumAccumulateU32(sSYNetPeerInputChecksum, player);
 		sSYNetPeerInputChecksum = syNetPeerChecksumAccumulateFrame(sSYNetPeerInputChecksum, &frames[i]);
+	}
+	/* The newest tick we hold from every remote port: what the time sync
+	 * and the HUD measure against. */
+	{
+		u32 lowest = 0;
+		sb32 any = FALSE;
+		s32 slot;
+
+		for (slot = 0; slot < MAXCONTROLLERS; slot++)
+		{
+			if (!(sSYNetPeerRemoteMask & (1 << slot)))
+			{
+				continue;
+			}
+			if (sSYNetPeerSlotHasTick[slot] == FALSE)
+			{
+				lowest = 0;
+				any = TRUE;
+				break;
+			}
+			if ((any == FALSE) || (sSYNetPeerSlotHighestTick[slot] < lowest))
+			{
+				lowest = sSYNetPeerSlotHighestTick[slot];
+				any = TRUE;
+			}
+		}
+		sSYNetPeerHighestRemoteTick = lowest;
 	}
 }
 
 void syNetPeerReceiveRemoteInput(void)
 {
 #ifdef PORT
-	u8 buffer[SYNETPEER_PACKET_BYTES];
-
-	syNetPeerReceiveAll(syNetPeerHandlePacket, buffer, sizeof(buffer));
+	syNetPeerReceiveAll();
 #endif
 }
 
@@ -1774,22 +3301,40 @@ void syNetPeerUpdateStartBarrier(void)
 		return;
 	}
 	sSYNetPeerBattleBarrierWaitFrames++;
+
+	/* Watching: nobody waits on us, so nothing to send. Go once every
+	 * player's tick 0 is here (sys/netstate.c holds the ticks after it). */
+	if (sSYNetPeerLocalPlayer < 0)
+	{
+		if (syNetInputCheckRemoteConfirmed(0) != FALSE)
+		{
+			syNetPeerReleaseBattleBarrier("spectator");
+		}
+		else syNetPeerLogBarrierWait();
+
+		return;
+	}
 	syNetPeerSendControlPacket(SYNETPEER_PACKET_BATTLE_READY);
 
-	if (sSYNetPeerBattlePeerReady != FALSE)
+	/* The host waits for every player in the round (not the spectators,
+	 * whose game just follows the inputs). */
+	if (sSYNetPeerBootstrapIsHost != FALSE)
 	{
-		if (sSYNetPeerBootstrapIsHost != FALSE)
+		if (syNetPeerCheckRoundMembers(1, TRUE) != FALSE)
 		{
 			syNetPeerSendControlPacket(SYNETPEER_PACKET_BATTLE_START);
 			sSYNetPeerBattleStartSent = TRUE;
 
-			if (sSYNetPeerBattleStartReceived != FALSE)
+			if (syNetPeerCheckRoundMembers(2, TRUE) != FALSE)
 			{
 				sSYNetPeerBattleStartRepeatFrames = SYNETPEER_BATTLE_START_REPEAT_FRAMES;
 				syNetPeerReleaseBattleBarrier("client-ack");
 			}
 		}
-		else if (sSYNetPeerBattleStartReceived != FALSE)
+	}
+	else if (sSYNetPeerBattlePeerReady != FALSE)
+	{
+		if (sSYNetPeerBattleStartReceived != FALSE)
 		{
 			syNetPeerSendControlPacket(SYNETPEER_PACKET_BATTLE_START);
 			sSYNetPeerBattleStartSent = TRUE;
@@ -1807,6 +3352,14 @@ void syNetPeerUpdateBattleGate(void)
 	{
 		return;
 	}
+#ifdef PORT
+	/* Receives too. A round applied here (a player dropped) resets the
+	 * battle scene; the rest of this tick no longer matters. */
+	if (syNetPeerServiceRound() != FALSE)
+	{
+		return;
+	}
+#endif
 	syNetPeerReceiveRemoteInput();
 	syNetPeerUpdateStartBarrier();
 
@@ -1848,9 +3401,30 @@ sb32 syNetPeerCheckActive(void)
 	return sSYNetPeerIsActive;
 }
 
+/* A guest: to the host. The host: the slowest player in the round. */
 u32 syNetPeerGetPingMs(void)
 {
+#ifdef PORT
+	u32 ping = 0;
+	s32 i;
+
+	if (sSYNetPeerIsHub == FALSE)
+	{
+		return sSYNetPeerMembers[0].ping_ms;
+	}
+	for (i = 1; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		SYNetPeerMember *m = &sSYNetPeerMembers[i];
+
+		if ((m->is_used != FALSE) && (m->is_in_round != FALSE) && (m->slot >= 0) && (m->ping_ms > ping))
+		{
+			ping = m->ping_ms;
+		}
+	}
+	return ping;
+#else
 	return sSYNetPeerPingMs;
+#endif
 }
 
 u32 syNetPeerGetInputDelay(void)
@@ -1862,7 +3436,7 @@ u32 syNetPeerGetInputDelay(void)
  * Positive = we are ahead (predicting), negative = behind. */
 s32 syNetPeerGetLocalAdvantage(void)
 {
-	if (sSYNetPeerIsActive == FALSE)
+	if ((sSYNetPeerIsActive == FALSE) || (sSYNetPeerLocalPlayer < 0))
 	{
 		return 0;
 	}
@@ -1873,11 +3447,31 @@ s32 syNetPeerGetLocalAdvantage(void)
  * first packet. Positive means we should give way. */
 s32 syNetPeerGetAdvantageDelta(void)
 {
-	if ((sSYNetPeerIsActive == FALSE) || (sSYNetPeerRemoteAdvantageValid == FALSE))
+	s32 lowest = 0;
+	sb32 any = FALSE;
+	s32 slot;
+
+	if ((sSYNetPeerIsActive == FALSE) || (sSYNetPeerLocalPlayer < 0))
 	{
 		return 0;
 	}
-	return syNetPeerGetLocalAdvantage() - sSYNetPeerRemoteAdvantage;
+	/* Against the player furthest behind: we give way to the slowest. */
+	for (slot = 0; slot < MAXCONTROLLERS; slot++)
+	{
+		if ((sSYNetPeerRemoteMask & (1 << slot)) && (sSYNetPeerSlotAdvantageValid[slot] != FALSE))
+		{
+			if ((any == FALSE) || (sSYNetPeerSlotAdvantage[slot] < lowest))
+			{
+				lowest = sSYNetPeerSlotAdvantage[slot];
+				any = TRUE;
+			}
+		}
+	}
+	if (any == FALSE)
+	{
+		return 0;
+	}
+	return syNetPeerGetLocalAdvantage() - lowest;
 }
 
 /* Called by sys/netstate.c instead of the tick while it stalls for a peer
@@ -1890,8 +3484,22 @@ void syNetPeerPumpWhileStalled(void)
 	{
 		return;
 	}
+#ifdef PORT
+	if (syNetPeerServiceRound() != FALSE)
+	{
+		return;
+	}
+#endif
 	syNetPeerReceiveRemoteInput();
 	syNetPeerSendLocalInput();
+#ifdef PORT
+	/* A spectator sends no input: its pings are how the host knows it is
+	 * still there. */
+	if (sSYNetPeerLocalPlayer < 0)
+	{
+		syNetPeerSendPeriodicPing();
+	}
+#endif
 }
 
 void syNetPeerStopVSSession(void)
@@ -1903,9 +3511,17 @@ void syNetPeerStopVSSession(void)
 		         sSYNetPeerPacketsSent, sSYNetPeerPacketsReceived, sSYNetPeerPacketsDropped,
 		         sSYNetPeerFramesStaged, sSYNetPeerLateFrames, sSYNetPeerInputChecksum);
 	}
-	if ((sSYNetPeerMenuMode != FALSE) && (sSYNetPeerIsActive != FALSE))
+	if (sSYNetPeerMenuMode != FALSE)
 	{
 		s32 i;
+
+		/* Not a battle of this session's (a round reset already left it, or
+		 * it never started): nothing to hand back. */
+		if ((sSYNetPeerIsActive == FALSE) || (sSYNetPeerBattleRunning == FALSE))
+		{
+			return;
+		}
+		sSYNetPeerBattleRunning = FALSE;
 
 		/* The peer may still be a few ticks short of the end: repeat the last
 		 * input packet, since nothing retransmits once the battle is gone. */
@@ -1916,8 +3532,9 @@ void syNetPeerStopVSSession(void)
 		/* Back to the menus (results, then the character select) in
 		 * lockstep; the connection stays up for the next game. */
 		syNetPeerBeginPhase();
-		syNetMenuStart(sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer, sSYNetPeerInputDelay, -1,
-		               sSYNetPeerBootstrapSeed ^ (sSYNetPeerSessionPhase * 2654435761U));
+		syNetMenuStart(sSYNetPeerLocalPlayer, sSYNetPeerRemoteMask, sSYNetPeerInputDelay, -1,
+		               sSYNetPeerBootstrapSeed ^ (sSYNetPeerSessionPhase * 2654435761U), FALSE);
+		syNetPeerApplyEarlyFrames();
 		return;
 	}
 	if ((sSYNetPeerLobbySession != FALSE) && (sSYNetPeerIsActive != FALSE) && (sSYNetPeerPostMatch == FALSE))

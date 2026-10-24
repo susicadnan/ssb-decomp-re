@@ -108,6 +108,7 @@ extern sb32 syNetInputGetLocalQueuedFrame(s32 player, u32 tick, SYNetInputFrame 
 extern u32 syNetInputGetLocalQueuedCount(s32 player);
 extern u32 syNetInputGetRemoteConfirmedCount(s32 player);
 extern u32 syNetInputGetRemoteLag(void);
+extern sb32 syNetInputCheckRemoteConfirmed(u32 tick);
 extern void syNetInputSetLocalHardwarePort(s32 port);
 extern sb32 syNetInputGetRemoteFrame(s32 player, u32 tick, SYNetInputFrame *out_frame);
 extern void syNetInputQueueLocalFrame(s32 player, u32 tick);
