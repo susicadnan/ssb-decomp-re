@@ -13,6 +13,8 @@ extern void* func_800269C0_275C0(u16);
 
 #ifdef PORT
 extern float port_widescreen_clip_x_scale(void);
+extern const char* syNetPeerGetSlotName(s32 slot);
+#define MNVSRESULTS_PORT_TAG_NAME_SCALE 0.3F
 #include "fighter_registry.h"
 #endif
 
@@ -1165,6 +1167,12 @@ void mnVSResultsMakePlayerTag(s32 player, s32 color_id)
 		llIFCommonPlayerTags3PSprite, llIFCommonPlayerTags4PSprite
 	};
 
+#ifdef PORT
+	const char *name = NULL;
+	f32 name_width = 0.0F;
+	f32 name_height = 0.0F;
+#endif
+
 	gobj = gcMakeGObjSPAfter(0, NULL, 18, GOBJ_PRIORITY_DEFAULT);
 	gcAddGObjDisplay(gobj, lbCommonDrawSObjAttr, 27, GOBJ_PRIORITY_DEFAULT, ~0);
 
@@ -1179,6 +1187,17 @@ void mnVSResultsMakePlayerTag(s32 player, s32 color_id)
 		sobj->sprite.red = dIFCommonPlayerTagPrimColorsR[color_id];
 		sobj->sprite.green = dIFCommonPlayerTagPrimColorsG[color_id];
 		sobj->sprite.blue = dIFCommonPlayerTagPrimColorsB[color_id];
+#ifdef PORT
+		/* Online: the player's name instead of 1P..4P. */
+		name = syNetPeerGetSlotName(player);
+
+		if (name != NULL)
+		{
+			sobj->sprite.attr |= SP_HIDDEN;
+			name_width = ifCommonPortNameMakeSObjs(gobj, name, sMNVSResultsFiles[6], sMNVSResultsFiles[5],
+			                                       MNVSRESULTS_PORT_TAG_NAME_SCALE, sobj, &name_height);
+		}
+#endif
 	}
 	else
 	{
@@ -1194,6 +1213,21 @@ void mnVSResultsMakePlayerTag(s32 player, s32 color_id)
 	}
 
 	mnVSResultsSetPlayerTagPosition(gobj, player);
+
+#ifdef PORT
+	/* The name sits centred on where the label would be, on its baseline. */
+	if (name != NULL)
+	{
+		sobj = SObjGetStruct(gobj);
+
+		ifCommonPortNamePlace
+		(
+			sobj->next,
+			(sobj->pos.x + (sobj->sprite.width * 0.5F)) - (name_width * 0.5F),
+			(sobj->pos.y + sobj->sprite.height) - name_height
+		);
+	}
+#endif
 }
 
 // 0x80133E7C

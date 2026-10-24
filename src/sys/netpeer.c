@@ -1717,6 +1717,24 @@ void syNetPeerHostConfigure(intptr_t sock, u32 delay, u32 session_id, u32 seed)
 	         sSYNetPeerBootstrapSeed);
 }
 
+sb32 syNetPeerCheckCodesEqual(const char *a, const char *b)
+{
+	s32 i;
+
+	for (i = 0; i < SYNETPEER_CODE_BYTES; i++)
+	{
+		if (a[i] != b[i])
+		{
+			return FALSE;
+		}
+		if (a[i] == '\0')
+		{
+			break;
+		}
+	}
+	return TRUE;
+}
+
 /* Someone reached the host (before or after Start). Returns their member
  * number, -1 if the session is full. They join at the next round. */
 s32 syNetPeerHostAddMember(const PortNetAddr *addr, const char *code)
@@ -1736,6 +1754,20 @@ s32 syNetPeerHostAddMember(const PortNetAddr *addr, const char *code)
 			syNetPeerCopyCode(sSYNetPeerMembers[i].code, code);
 		}
 		return i;
+	}
+	/* The same person from another address: a friend found by code tries
+	 * all of our endpoints (public, LAN, loopback) at once, and whichever
+	 * reaches us last is the one they kept. */
+	if ((code != NULL) && (code[0] != '\0'))
+	{
+		for (i = 1; i < SYNETPEER_MAX_MEMBERS; i++)
+		{
+			if ((sSYNetPeerMembers[i].is_used != FALSE) && (syNetPeerCheckCodesEqual(sSYNetPeerMembers[i].code, code) != FALSE))
+			{
+				sSYNetPeerMembers[i].addr = *addr;
+				return i;
+			}
+		}
 	}
 	for (i = 1; i < SYNETPEER_MAX_MEMBERS; i++)
 	{
@@ -2598,6 +2630,42 @@ s32 syNetPeerGetMemberInfo(s32 member, const char **code, s32 *slot, s32 *queue_
 	*is_me = (member == sSYNetPeerMyMember) ? TRUE : FALSE;
 
 	return TRUE;
+}
+
+/* Who plays player slot `slot` this round, as the name part of their
+ * connect code ("ADO" for ADO#1148), for the game's own name labels. NULL
+ * outside a session, for an empty slot, or for a member without a code.
+ * The table comes from the host's round config, so every machine in the
+ * session gets the same answer: labels built from it make the same objects
+ * everywhere, which keeps the rollback state identical. */
+const char* syNetPeerGetSlotName(s32 slot)
+{
+	static char names[MAXCONTROLLERS][SYNETPEER_CODE_BYTES];
+	s32 i;
+	s32 c;
+
+	if ((slot < 0) || (slot >= MAXCONTROLLERS) || (sSYNetPeerIsEnabled == FALSE) || (sSYNetPeerMenuMode == FALSE) ||
+	    (sSYNetPeerRoundsApplied == 0))
+	{
+		return NULL;
+	}
+	for (i = 0; i < SYNETPEER_MAX_MEMBERS; i++)
+	{
+		SYNetPeerMember *m = &sSYNetPeerMembers[i];
+
+		if ((m->is_used == FALSE) || (m->is_in_round == FALSE) || (m->slot != slot))
+		{
+			continue;
+		}
+		for (c = 0; (c < SYNETPEER_CODE_BYTES - 1) && (m->code[c] != '\0') && (m->code[c] != '#'); c++)
+		{
+			names[slot][c] = m->code[c];
+		}
+		names[slot][c] = '\0';
+
+		return (c != 0) ? names[slot] : NULL;
+	}
+	return NULL;
 }
 
 sb32 syNetPeerCheckSpectating(void)

@@ -47,6 +47,7 @@ static void ifCommonPortFixupSpriteFull(Sprite *sprite)
 }
 
 extern bool port_enhancement_is_hud_disabled(void);
+extern const char* syNetPeerGetSlotName(s32 slot);
 #endif
 
 // // // // // // // // // // // //
@@ -1996,6 +1997,137 @@ void ifCommonPlayerArrowsUpdateFlags(f32 x, f32 y)
     }
 }
 
+#ifdef PORT
+/* ---- Online names in the game's own letters ----
+ * In a netplay session the "1P".."4P" labels show the name part of each
+ * player's connect code instead (ADO#1148 -> ADO), spelled with the
+ * announcer letters (GAME SET, WINS!) and the damage digits, scaled down and
+ * tinted with the label's colour. Every glyph is an SObj appended to the
+ * label's GObj after the original label SObj, which stays first (hidden) so
+ * code that moves the label keeps working. A glyph's offset from the top
+ * left of the name, in quarter pixels, is packed into its user_data (x low
+ * half, y high half); ifCommonPortNamePlace moves the whole name. */
+f32 dIFCommonPortNameLetterWidths[/* */] =
+{
+	35.0F, 24.0F, 24.0F, 28.0F, 22.0F, 20.0F, 31.0F, 27.0F, 9.0F, 20.0F, 27.0F, 20.0F, 37.0F, 29.0F,
+	34.0F, 24.0F, 37.0F, 27.0F, 24.0F, 24.0F, 26.0F, 28.0F, 39.0F, 31.0F, 29.0F, 30.0F
+};
+intptr_t dIFCommonPortNameLetterOffsets[/* */] =
+{
+	llIFCommonAnnounceCommonLetterASprite, llIFCommonAnnounceCommonLetterBSprite,
+	llIFCommonAnnounceCommonLetterCSprite, llIFCommonAnnounceCommonLetterDSprite,
+	llIFCommonAnnounceCommonLetterESprite, llIFCommonAnnounceCommonLetterFSprite,
+	llIFCommonAnnounceCommonLetterGSprite, llIFCommonAnnounceCommonLetterHSprite,
+	llIFCommonAnnounceCommonLetterISprite, llIFCommonAnnounceCommonLetterJSprite,
+	llIFCommonAnnounceCommonLetterKSprite, llIFCommonAnnounceCommonLetterLSprite,
+	llIFCommonAnnounceCommonLetterMSprite, llIFCommonAnnounceCommonLetterNSprite,
+	llIFCommonAnnounceCommonLetterOSprite, llIFCommonAnnounceCommonLetterPSprite,
+	llIFCommonAnnounceCommonLetterQSprite, llIFCommonAnnounceCommonLetterRSprite,
+	llIFCommonAnnounceCommonLetterSSprite, llIFCommonAnnounceCommonLetterTSprite,
+	llIFCommonAnnounceCommonLetterUSprite, llIFCommonAnnounceCommonLetterVSprite,
+	llIFCommonAnnounceCommonLetterWSprite, llIFCommonAnnounceCommonLetterXSprite,
+	llIFCommonAnnounceCommonLetterYSprite, llIFCommonAnnounceCommonLetterZSprite
+};
+intptr_t dIFCommonPortNameDigitOffsets[/* */] =
+{
+	llIFCommonDigits0Sprite, llIFCommonDigits1Sprite, llIFCommonDigits2Sprite, llIFCommonDigits3Sprite,
+	llIFCommonDigits4Sprite, llIFCommonDigits5Sprite, llIFCommonDigits6Sprite, llIFCommonDigits7Sprite,
+	llIFCommonDigits8Sprite, llIFCommonDigits9Sprite
+};
+
+/* Width and height of the name in the battle's player tags. */
+f32 sIFCommonPortTagNameWidth[GMCOMMON_PLAYERS_MAX];
+f32 sIFCommonPortTagNameHeight[GMCOMMON_PLAYERS_MAX];
+
+s32 ifCommonPortNamePackOffset(f32 x, f32 y)
+{
+	return (s32)(((u32)(s16)(x * 4.0F) & 0xFFFF) | ((u32)(s16)(y * 4.0F) << 16));
+}
+
+/* Appends the glyphs of name (A-Z and 0-9; anything else is skipped) to
+ * gobj. letters_file is a loaded IFCommonAnnounceCommon, digits_file an
+ * IFCommonDigits (NULL leaves digits out). The glyph colours come from
+ * the label's. Returns the width; *height gets the tallest glyph. */
+f32 ifCommonPortNameMakeSObjs(GObj *gobj, const char *name, void *letters_file, void *digits_file, f32 scale,
+                              const SObj *colors_from, f32 *height)
+{
+	SObj *glyphs[IFCOMMON_PORT_NAME_GLYPHS_MAX];
+	f32 x = 0.0F;
+	f32 max_height = 0.0F;
+	s32 count = 0;
+	s32 i;
+
+	for (i = 0; (name[i] != '\0') && (count < IFCOMMON_PORT_NAME_GLYPHS_MAX); i++)
+	{
+		char c = name[i];
+		SObj *sobj;
+		f32 advance;
+
+		if ((c >= 'a') && (c <= 'z'))
+		{
+			c -= 'a' - 'A';
+		}
+		if ((c >= 'A') && (c <= 'Z'))
+		{
+			sobj = lbCommonMakeSObjForGObj(gobj, lbRelocGetFileData(Sprite*, letters_file, dIFCommonPortNameLetterOffsets[c - 'A']));
+			advance = dIFCommonPortNameLetterWidths[c - 'A'] * scale;
+		}
+		else if ((c >= '0') && (c <= '9') && (digits_file != NULL))
+		{
+			sobj = lbCommonMakeSObjForGObj(gobj, lbRelocGetFileData(Sprite*, digits_file, dIFCommonPortNameDigitOffsets[c - '0']));
+			advance = (sobj->sprite.width + 2.0F) * scale;
+		}
+		else continue;
+
+		sobj->sprite.scalex = scale;
+		sobj->sprite.scaley = scale;
+		sobj->sprite.attr &= ~SP_FASTCOPY;
+		sobj->sprite.attr |= SP_TRANSPARENT;
+		/* The announcer letters shade from the env colour at their edges
+		 * to the prim colour in the middle: the label's colour at the edge
+		 * and a light tint of it inside reads well on any stage. */
+		sobj->envcolor.r = colors_from->sprite.red;
+		sobj->envcolor.g = colors_from->sprite.green;
+		sobj->envcolor.b = colors_from->sprite.blue;
+		sobj->sprite.red = colors_from->sprite.red + ((0xFF - colors_from->sprite.red) * 3) / 5;
+		sobj->sprite.green = colors_from->sprite.green + ((0xFF - colors_from->sprite.green) * 3) / 5;
+		sobj->sprite.blue = colors_from->sprite.blue + ((0xFF - colors_from->sprite.blue) * 3) / 5;
+		sobj->user_data.s = ifCommonPortNamePackOffset(x, 0.0F);
+
+		if ((sobj->sprite.height * scale) > max_height)
+		{
+			max_height = sobj->sprite.height * scale;
+		}
+		glyphs[count++] = sobj;
+		x += advance;
+	}
+	/* Bottoms line up (the digits are shorter than the letters). */
+	for (i = 0; i < count; i++)
+	{
+		glyphs[i]->user_data.s = ifCommonPortNamePackOffset
+		(
+			(s16)(glyphs[i]->user_data.s & 0xFFFF) / 4.0F,
+			max_height - (glyphs[i]->sprite.height * glyphs[i]->sprite.scaley)
+		);
+	}
+	*height = max_height;
+
+	return x;
+}
+
+/* Every SObj from first on is a glyph: put the name's top left at x, y. */
+void ifCommonPortNamePlace(SObj *first, f32 x, f32 y)
+{
+	SObj *sobj;
+
+	for (sobj = first; sobj != NULL; sobj = sobj->next)
+	{
+		sobj->pos.x = (s32)(x + ((s16)(sobj->user_data.s & 0xFFFF) / 4.0F));
+		sobj->pos.y = (s32)(y + ((s16)((u32)sobj->user_data.s >> 16) / 4.0F));
+	}
+}
+#endif
+
 // 0x80111A3C
 void ifCommonPlayerTagProcDisplay(GObj *interface_gobj)
 {
@@ -2022,6 +2154,17 @@ void ifCommonPlayerTagProcDisplay(GObj *interface_gobj)
 
             if (gmCameraCheckTargetInBounds(x, y) != FALSE)
             {
+#ifdef PORT
+                if (SObjGetStruct(interface_gobj)->next != NULL)
+                {
+                    ifCommonPortNamePlace
+                    (
+                        SObjGetStruct(interface_gobj)->next,
+                        (gGMCameraStruct.viewport_center_x + x) - (sIFCommonPortTagNameWidth[player] * 0.5F),
+                        (gGMCameraStruct.viewport_center_y - y) - sIFCommonPortTagNameHeight[player]
+                    );
+                }
+#endif
                 SObjGetStruct(interface_gobj)->pos.x = (s32) ((gGMCameraStruct.viewport_center_x + x) - (SObjGetStruct(interface_gobj)->sprite.width * 0.5F));
                 SObjGetStruct(interface_gobj)->pos.y = (s32) ((gGMCameraStruct.viewport_center_y - y) - SObjGetStruct(interface_gobj)->sprite.height);
 
@@ -2061,6 +2204,28 @@ void ifCommonPlayerTagMakeInterface(void)
             sobj->envcolor.g = dIFCommonPlayerTagEnvColorsG[color_id];
             sobj->envcolor.b = dIFCommonPlayerTagEnvColorsB[color_id];
 
+#ifdef PORT
+            /* Online: the player's name instead of 1P..4P (CP and ally tags stay). */
+            if (gSCManagerBattleState->players[player].tag < nIFPlayerTagKindCP)
+            {
+                const char *name = syNetPeerGetSlotName(player);
+
+                if (name != NULL)
+                {
+                    sobj->sprite.attr |= SP_HIDDEN;
+                    sIFCommonPortTagNameWidth[player] = ifCommonPortNameMakeSObjs
+                    (
+                        interface_gobj,
+                        name,
+                        gGMCommonFiles[7],
+                        gGMCommonFiles[4],
+                        IFCOMMON_PORT_TAG_NAME_SCALE,
+                        sobj,
+                        &sIFCommonPortTagNameHeight[player]
+                    );
+                }
+            }
+#endif
             ifSetPlayer(interface_gobj, player);
         }
     }

@@ -48,6 +48,7 @@ extern void syNetPeerReportStall(const char *reason);
 extern sb32 syNetPeerCheckSpectating(void);
 extern sb32 syNetPeerCheckGroupHost(void);
 extern s32 syNetPeerGetMemberInfo(s32 member, const char **code, s32 *slot, s32 *queue_pos, sb32 *is_me);
+extern const char* syNetPeerGetSlotName(s32 slot);
 #endif
 
 #endif /* _SYNETPEER_H_ */

@@ -15,6 +15,8 @@ extern char *getenv(const char *name);
 extern int atoi(const char *str);
 extern float port_widescreen_clip_x_scale(void);
 #include "fighter_registry.h"
+extern const char* syNetPeerGetSlotName(s32 slot);
+#define MNPLAYERS_PORT_CURSOR_NAME_SCALE 0.24F
 #endif
 
 
@@ -38,6 +40,10 @@ u32 dMNPlayersVSFileIDs[/* */] =
 	/* [7] Classic Co-op: difficulty text sprites for the classic-context
 	 * selector (same file the 1P CSS loads as its slot 6). */
 	, llMNPlayersDifficultyFileID
+	/* [8], [9] Online: letters and digits for the players' names on the
+	 * cursors (if/ifcommon.c, ifCommonPortNameMakeSObjs). */
+	, llIFCommonAnnounceCommonFileID
+	, llIFCommonDigitsFileID
 #endif
 };
 
@@ -2030,7 +2036,38 @@ void mnPlayersVSUpdateCursor(GObj *gobj, s32 player, s32 cursor_status)
 	sobj->envcolor.r = colors[player].env.r;
 	sobj->envcolor.g = colors[player].env.g;
 	sobj->envcolor.b = colors[player].env.b;
+
+#ifdef PORT
+	/* Online: the player's name next to the hand instead of 1P..4P; placed
+	 * where the label is by mnPlayersVSPortCursorProcDisplay. */
+	{
+		const char *name = syNetPeerGetSlotName(player);
+		f32 height;
+
+		if (name != NULL)
+		{
+			sobj->sprite.attr |= SP_HIDDEN;
+			ifCommonPortNameMakeSObjs(gobj, name, sMNPlayersVSFiles[8], sMNPlayersVSFiles[9],
+			                          MNPLAYERS_PORT_CURSOR_NAME_SCALE, sobj, &height);
+		}
+	}
+#endif
 }
+
+#ifdef PORT
+/* The cursor's SObjs are the hand, the 1P..4P label, then (online) the
+ * name's glyphs, which follow the label wherever the cursor code put it. */
+void mnPlayersVSPortCursorProcDisplay(GObj *gobj)
+{
+	SObj *label = SObjGetStruct(gobj)->next;
+
+	if ((label != NULL) && (label->next != NULL))
+	{
+		ifCommonPortNamePlace(label->next, label->pos.x, label->pos.y + 1.0F);
+	}
+	lbCommonDrawSObjAttr(gobj);
+}
+#endif
 
 // 0x80134F64
 sb32 mnPlayersVSCheckTimeArrowRInRange(GObj *gobj)
@@ -4124,7 +4161,11 @@ void mnPlayersVSMakeCursor(s32 player)
 		NULL,
 		19,
 		GOBJ_PRIORITY_DEFAULT,
+#ifdef PORT
+		mnPlayersVSPortCursorProcDisplay,
+#else
 		lbCommonDrawSObjAttr,
+#endif
 		32,
 		priorities[player],
 		~0,
