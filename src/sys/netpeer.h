@@ -11,6 +11,7 @@ extern sb32 syNetPeerCheckStartBarrierReleased(void);
 extern void syNetPeerUpdateBattleGate(void);
 extern void syNetPeerUpdate(void);
 extern void syNetPeerPumpWhileStalled(void);
+extern void syNetPeerReceiveBeforeTick(void);
 extern s32 syNetPeerGetLocalAdvantage(void);
 extern s32 syNetPeerGetAdvantageDelta(void);
 extern sb32 syNetPeerCheckActive(void);

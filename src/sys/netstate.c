@@ -712,6 +712,8 @@ void syNetStateRunTick(void (*task_update)(void *), void *tfunc)
 		port_watchdog_note_tick();
 		return;
 	}
+	/* Inputs that arrived while the last frame drew count for this tick. */
+	syNetPeerReceiveBeforeTick();
 	cur = syNetInputGetTick();
 	sSYNetStateDiagTick = cur;
 	is_spectating = syNetPeerCheckSpectating();

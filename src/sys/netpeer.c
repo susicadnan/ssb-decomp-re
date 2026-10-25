@@ -3218,6 +3218,21 @@ void syNetPeerReceiveRemoteInput(void)
 #endif
 }
 
+/* Called by netstate before each real tick, ahead of the stall check and the
+ * rollback it may run. The battle gate also receives, but only after the
+ * tick's simulation, so a packet that came in while the last frame was being
+ * drawn would otherwise sit in the socket for a whole tick: its input missed
+ * that tick (one more frame predicted, one deeper rollback), and a PING
+ * waited a frame for its PONG, which the HUD then showed as ping. */
+void syNetPeerReceiveBeforeTick(void)
+{
+	if (sSYNetPeerIsActive == FALSE)
+	{
+		return;
+	}
+	syNetPeerReceiveRemoteInput();
+}
+
 #ifdef PORT
 void syNetPeerLogNetSyncValidation(u32 tick)
 {
@@ -3284,9 +3299,9 @@ void syNetPeerLogStats(void)
 	}
 	sSYNetPeerLastLogTick = tick;
 
-	port_log("SSB64 NetPeer: role=%s local=%d remote=%d barrier=%d execution_ready=%d tick=%u sent=%u recv=%u dropped=%u staged=%u highest_remote=%u late=%u snd_next=%u rcv_hw=%u seq_gap=%u seq_dup=%u seq_ooo=%u peer_ack=%u inpchk=0x%08X\n",
+	port_log("SSB64 NetPeer: role=%s local=%d remote=%d ping=%ums delay=%u barrier=%d execution_ready=%d tick=%u sent=%u recv=%u dropped=%u staged=%u highest_remote=%u late=%u snd_next=%u rcv_hw=%u seq_gap=%u seq_dup=%u seq_ooo=%u peer_ack=%u inpchk=0x%08X\n",
 	         (sSYNetPeerBootstrapIsHost != FALSE) ? "host" : "client",
-	         sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer,
+	         sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer, syNetPeerGetPingMs(), sSYNetPeerInputDelay,
 	         sSYNetPeerBattleBarrierReleased, syNetPeerCheckBattleExecutionReady(), tick,
 	         sSYNetPeerPacketsSent, sSYNetPeerPacketsReceived, sSYNetPeerPacketsDropped,
 	         sSYNetPeerFramesStaged, sSYNetPeerHighestRemoteTick, sSYNetPeerLateFrames,
