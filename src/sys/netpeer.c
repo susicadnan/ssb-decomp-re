@@ -3292,16 +3292,19 @@ void syNetPeerLogStats(void)
 {
 #ifdef PORT
 	u32 tick = syNetInputGetTick();
+	u32 rollbacks, resim_ticks, max_depth, stalls, timesync_skips;
 
 	if ((tick == 0) || ((tick - sSYNetPeerLastLogTick) < SYNETPEER_LOG_INTERVAL))
 	{
 		return;
 	}
 	sSYNetPeerLastLogTick = tick;
+	syNetStateGetStats(&rollbacks, &resim_ticks, &max_depth, &stalls, &timesync_skips);
 
-	port_log("SSB64 NetPeer: role=%s local=%d remote=%d ping=%ums delay=%u barrier=%d execution_ready=%d tick=%u sent=%u recv=%u dropped=%u staged=%u highest_remote=%u late=%u snd_next=%u rcv_hw=%u seq_gap=%u seq_dup=%u seq_ooo=%u peer_ack=%u inpchk=0x%08X\n",
+	port_log("SSB64 NetPeer: role=%s local=%d remote=%d ping=%ums delay=%u rollbacks=%u resim=%u max_depth=%u stalls=%u skips=%u barrier=%d execution_ready=%d tick=%u sent=%u recv=%u dropped=%u staged=%u highest_remote=%u late=%u snd_next=%u rcv_hw=%u seq_gap=%u seq_dup=%u seq_ooo=%u peer_ack=%u inpchk=0x%08X\n",
 	         (sSYNetPeerBootstrapIsHost != FALSE) ? "host" : "client",
 	         sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer, syNetPeerGetPingMs(), sSYNetPeerInputDelay,
+	         rollbacks, resim_ticks, max_depth, stalls, timesync_skips,
 	         sSYNetPeerBattleBarrierReleased, syNetPeerCheckBattleExecutionReady(), tick,
 	         sSYNetPeerPacketsSent, sSYNetPeerPacketsReceived, sSYNetPeerPacketsDropped,
 	         sSYNetPeerFramesStaged, sSYNetPeerHighestRemoteTick, sSYNetPeerLateFrames,
