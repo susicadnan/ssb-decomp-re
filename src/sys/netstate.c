@@ -23,6 +23,7 @@
  */
 
 extern void port_log(const char *fmt, ...);
+extern u32 port_netsock_now_ms(void);
 /* The decomp stdlib.h shadow has no atoi; netpeer.c declares it the same way. */
 extern int atoi(const char *s);
 /* port/port_watchdog.cpp: tick liveness for the hang report. */
@@ -51,7 +52,7 @@ extern int syNetStateSectionGetRanges(void **starts, size_t *sizes, int max_rang
 
 #define SYNETSTATE_RANGES_MAX 4
 #define SYNETSTATE_LOG_LIMIT 32
-#define SYNETSTATE_DISCONNECT_FRAMES 600
+#define SYNETSTATE_DISCONNECT_MS 10000 /* on the clock: how often a stalled frame comes back depends on the display */
 #define SYNETSTATE_SPECTATOR_BUFFER 4 /* ticks a spectator holds in hand before its first */
 
 typedef struct SYNetStateSlot
@@ -106,6 +107,7 @@ static u32 sSYNetStateSyncTestRuns;
 static u32 sSYNetStateSyncTestMismatches;
 static u32 sSYNetStateStallCount;
 static u32 sSYNetStateStallRun;       /* consecutive stalled frames */
+static u32 sSYNetStateStallStartMs;   /* when the current run began */
 static u32 sSYNetStateTimeSyncSkips;
 static u32 sSYNetStateTimeSyncCooldown;
 static u32 sSYNetStateLogCount;
@@ -739,7 +741,10 @@ void syNetStateRunTick(void (*task_update)(void *), void *tfunc)
 	{
 		sSYNetStateDiagPhase = nSYNetStatePhaseStall;
 		sSYNetStateStallCount++;
-		sSYNetStateStallRun++;
+		if (sSYNetStateStallRun++ == 0)
+		{
+			sSYNetStateStallStartMs = port_netsock_now_ms();
+		}
 
 		if ((sSYNetStateStallCount % 60) == 1)
 		{
@@ -748,10 +753,10 @@ void syNetStateRunTick(void (*task_update)(void *), void *tfunc)
 		}
 		/* Ten seconds without a single input from the peer: they are gone.
 		 * netpeer ends the match and sends everyone back to the menu. */
-		if (sSYNetStateStallRun >= SYNETSTATE_DISCONNECT_FRAMES)
+		if ((port_netsock_now_ms() - sSYNetStateStallStartMs) >= SYNETSTATE_DISCONNECT_MS)
 		{
-			port_log("SSB64 NetState: no input from the peer for %u frames at tick %u — disconnecting\n",
-			         sSYNetStateStallRun, cur);
+			port_log("SSB64 NetState: no input from the peer for %u ms (%u frames) at tick %u — disconnecting\n",
+			         port_netsock_now_ms() - sSYNetStateStallStartMs, sSYNetStateStallRun, cur);
 			sSYNetStateStallRun = 0;
 			syNetPeerReportStall("connection lost");
 			return;
