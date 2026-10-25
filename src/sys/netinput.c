@@ -746,7 +746,7 @@ sb32 syNetInputGetReplayMetadata(SYNetInputReplayMetadata *out_metadata)
 
 void syNetInputFuncRead(void)
 {
-	SYNetInputFrame frame;
+	SYNetInputFrame frames[MAXCONTROLLERS];
 	u32 tick;
 	s32 player;
 
@@ -756,14 +756,20 @@ void syNetInputFuncRead(void)
 	}
 	tick = syNetInputGetTick();
 
+	/* Every slot's frame first, then publish: a guest's local slot reads its
+	 * pad from port 1 (sSYNetInputLocalHardwarePort), which publishing slot
+	 * 0 (the host's input) would already have overwritten. */
 	for (player = 0; player < MAXCONTROLLERS; player++)
 	{
-		syNetInputResolveFrame(player, tick, &frame);
-		syNetInputPublishFrame(player, &frame);
+		syNetInputResolveFrame(player, tick, &frames[player]);
+	}
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		syNetInputPublishFrame(player, &frames[player]);
 
 		if (sSYNetInputIsRecording != FALSE)
 		{
-			syNetInputSetReplayFrame(player, tick, &frame);
+			syNetInputSetReplayFrame(player, tick, &frames[player]);
 		}
 	}
 	syNetInputPublishMainController();
