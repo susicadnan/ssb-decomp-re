@@ -689,14 +689,23 @@ static void syNetStateRunSyncTest(u32 cur, void (*task_update)(void *), void *tf
 	{
 		if (before.column[column] != after.column[column])
 		{
+			/* Not through syNetStateLog: the rollback chatter can use up
+			 * its budget long before the one line that matters. */
 			if (mismatch == FALSE)
 			{
 				mismatch = TRUE;
 				sSYNetStateSyncTestMismatches++;
-				syNetStateLog("SSB64 NetState: SYNCTEST MISMATCH tick=%u depth=%u\n", cur, sSYNetStateSyncTestDepth);
+
+				if (sSYNetStateSyncTestMismatches <= 20)
+				{
+					port_log("SSB64 NetState: SYNCTEST MISMATCH tick=%u depth=%u\n", cur, sSYNetStateSyncTestDepth);
+				}
 			}
-			syNetStateLog("SSB64 NetState:   column %-8s live=%08X resim=%08X\n", syNetSyncGetColumnName(column),
-			              before.column[column], after.column[column]);
+			if (sSYNetStateSyncTestMismatches <= 20)
+			{
+				port_log("SSB64 NetState:   column %-8s live=%08X resim=%08X\n", syNetSyncGetColumnName(column),
+				         before.column[column], after.column[column]);
+			}
 		}
 	}
 }
