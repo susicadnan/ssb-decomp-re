@@ -15,10 +15,15 @@ extern char *getenv(const char *name);
 extern int atoi(const char *s);
 extern sb32 sSYNetInputFakeLocal; /* sys/netinput.c */
 extern void port_coroutine_yield(void);
+extern u32 port_netsock_now_ms(void);
 #endif
 
 /* Frames of consecutive waiting before the peer counts as gone (10 s). */
 #define SYNETMENU_DISCONNECT_FRAMES 600
+/* The port measures it on the clock instead: a yield that draws no new
+ * image comes back far sooner than a 60 Hz frame (hundreds a second
+ * without vsync), so 600 of them was about a second. */
+#define SYNETMENU_DISCONNECT_MS 10000
 #define SYNETMENU_LOG_INTERVAL 600
 
 sb32 sSYNetMenuIsActive;
@@ -231,6 +236,9 @@ sb32 syNetMenuFuncRead(void)
 	SYNetInputFrame frame;
 	u32 tick = syNetInputGetTick();
 	s32 player;
+#ifdef PORT
+	u32 wait_start_ms = 0;
+#endif
 
 	if (sSYNetMenuIsActive == FALSE)
 	{
@@ -327,13 +335,24 @@ sb32 syNetMenuFuncRead(void)
 		{
 			break;
 		}
+#ifdef PORT
+		if (sSYNetMenuWaitRun == 0)
+		{
+			wait_start_ms = port_netsock_now_ms();
+		}
+#endif
 		sSYNetMenuWaitRun++;
 		sSYNetMenuWaitTotal++;
 
+#ifdef PORT
+		if ((port_netsock_now_ms() - wait_start_ms) >= SYNETMENU_DISCONNECT_MS)
+#else
 		if (sSYNetMenuWaitRun >= SYNETMENU_DISCONNECT_FRAMES)
+#endif
 		{
 #ifdef PORT
-			port_log("SSB64 NetMenu: no input from port %d for %u frames at tick %u\n", player + 1, sSYNetMenuWaitRun, tick);
+			port_log("SSB64 NetMenu: no input from port %d for %u ms (%u waits) at tick %u\n", player + 1,
+			         port_netsock_now_ms() - wait_start_ms, sSYNetMenuWaitRun, tick);
 			sSYNetMenuWaitRun = 0;
 			syNetPeerReportStall("connection lost");
 #endif
